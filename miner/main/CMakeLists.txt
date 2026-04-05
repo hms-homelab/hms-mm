@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "wifi_manager.c"
+        "ezshare_client.c"
+        "uart_handler.c"
+        "scanner_task.c"
+        "nvs_config.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_wifi
+        esp_http_client
+        nvs_flash
+        driver
+        json
+    PRIV_REQUIRES
+        mbedtls
+)
