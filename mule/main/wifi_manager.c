@@ -37,8 +37,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         s_retry = 0;
         s_status = WIFI_STATUS_CONNECTED;
         mdns_init();
-        mdns_hostname_set("sleeplink");
-        ESP_LOGI(TAG, "mDNS hostname: sleeplink.local");
+        mdns_hostname_set("cpapdash");
+        ESP_LOGI(TAG, "mDNS hostname: cpapdash.local");
         xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
     }
 }
