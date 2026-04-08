@@ -3,6 +3,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include <string.h>
@@ -35,6 +36,9 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         ESP_LOGI(TAG, "Connected, IP: " IPSTR, IP2STR(&e->ip_info.ip));
         s_retry = 0;
         s_status = WIFI_STATUS_CONNECTED;
+        mdns_init();
+        mdns_hostname_set("sleeplink");
+        ESP_LOGI(TAG, "mDNS hostname: sleeplink.local");
         xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
     }
 }

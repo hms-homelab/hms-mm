@@ -16,6 +16,7 @@ idf_component_register(
         driver
         json
         lwip
+        mdns
     PRIV_REQUIRES
         mbedtls
         esp_timer
