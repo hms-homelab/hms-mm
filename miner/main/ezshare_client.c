@@ -34,6 +34,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
                 size_t new_capacity = response->capacity * 2;
                 if (new_capacity < response->size + evt->data_len)
                     new_capacity = response->size + evt->data_len + HTTP_BUFFER_SIZE;
+                if (new_capacity > 256 * 1024) return ESP_FAIL;
                 uint8_t *new_buffer = realloc(response->buffer, new_capacity);
                 if (!new_buffer) return ESP_FAIL;
                 response->buffer = new_buffer;

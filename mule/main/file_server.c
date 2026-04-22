@@ -106,8 +106,9 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
         goto cleanup;
     }
 
-    static char uart_buf[PROXY_UART_BUF_SIZE];
-    static uint8_t decode_buf[PROXY_CHUNK_SIZE];
+    char uart_buf[PROXY_UART_BUF_SIZE];
+    uint8_t decode_buf[PROXY_CHUNK_SIZE];
+    int parse_failures = 0;
 
     while (true) {
         int len = uart_receive_json(uart_buf, sizeof(uart_buf), PROXY_REQ_TIMEOUT_MS);
@@ -124,7 +125,21 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
         }
 
         cJSON *msg = cJSON_Parse(uart_buf);
-        if (!msg) continue;
+        if (!msg) {
+            if (++parse_failures > 10) {
+                ESP_LOGE(TAG, "Too many parse failures for req_id=%d", req_id);
+                if (!chunked_started) {
+                    httpd_resp_set_status(req, "502 Bad Gateway");
+                    httpd_resp_send(req, "Protocol error", HTTPD_RESP_USE_STRLEN);
+                } else {
+                    httpd_resp_send_chunk(req, NULL, 0);
+                }
+                ret = ESP_FAIL;
+                goto cleanup;
+            }
+            continue;
+        }
+        parse_failures = 0;
 
         cJSON *type = cJSON_GetObjectItem(msg, "type");
         if (!type || !cJSON_IsString(type)) { cJSON_Delete(msg); continue; }

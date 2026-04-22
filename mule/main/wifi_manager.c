@@ -69,7 +69,11 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
 
     wifi_config_t cfg = {0};
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-    if (password) strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
+    cfg.sta.ssid[sizeof(cfg.sta.ssid) - 1] = '\0';
+    if (password) {
+        strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
+        cfg.sta.password[sizeof(cfg.sta.password) - 1] = '\0';
+    }
     cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     esp_wifi_set_config(WIFI_IF_STA, &cfg);

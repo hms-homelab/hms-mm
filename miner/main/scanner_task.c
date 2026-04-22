@@ -53,9 +53,11 @@ void scanner_task_load_ezshare_creds(void)
         nvs_config_get_ezshare_pass(ez_pass, sizeof(ez_pass));
         ESP_LOGI(TAG, "NVS ezShare creds (SSID: %s)", ez_ssid);
     } else {
-        strncpy(ez_ssid, EZSHARE_WIFI_SSID_DEFAULT, sizeof(ez_ssid));
-        strncpy(ez_pass, EZSHARE_WIFI_PASSWORD_DEFAULT, sizeof(ez_pass));
-        ESP_LOGI(TAG, "Default ezShare creds (SSID: %s)", ez_ssid);
+        strncpy(ez_ssid, EZSHARE_WIFI_SSID_DEFAULT, sizeof(ez_ssid) - 1);
+        ez_ssid[sizeof(ez_ssid) - 1] = '\0';
+        strncpy(ez_pass, EZSHARE_WIFI_PASSWORD_DEFAULT, sizeof(ez_pass) - 1);
+        ez_pass[sizeof(ez_pass) - 1] = '\0';
+        ESP_LOGW(TAG, "No NVS ezShare creds — using defaults (SSID: %s)", ez_ssid);
     }
 }
 
@@ -194,7 +196,8 @@ static void handle_set_config(cJSON *root)
         if (json) { uart_send_json(json); free(json); }
         cJSON_Delete(ack);
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
     }
 }
@@ -233,6 +236,7 @@ static void scanner_task_loop(void *pvParameters)
                     if (id_j && path_j && cJSON_IsString(path_j)) {
                         proxy_req_id = id_j->valueint;
                         strncpy(proxy_path, path_j->valuestring, sizeof(proxy_path) - 1);
+                        proxy_path[sizeof(proxy_path) - 1] = '\0';
                         proxy_range_start = rs_j ? (uint32_t)rs_j->valueint : 0;
                         proxy_range_end   = re_j ? (uint32_t)re_j->valueint : 0;
 

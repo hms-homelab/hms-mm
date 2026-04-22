@@ -53,7 +53,12 @@ static void dns_server_task(void *arg)
         buf[6] = 0x00; buf[7] = 0x01;
 
         int pos = 12;
-        while (pos < len && buf[pos] != 0) pos += buf[pos] + 1;
+        while (pos < len && buf[pos] != 0) {
+            int label_len = buf[pos];
+            if (pos + label_len + 1 > len) break;
+            pos += label_len + 1;
+        }
+        if (pos >= len) continue;
         pos += 5;
         if (pos + 16 > (int)sizeof(buf)) continue;
 
@@ -130,7 +135,10 @@ static size_t url_decode(const char *src, char *dst, size_t dst_size)
         if (src[i] == '+') dst[j++] = ' ';
         else if (src[i] == '%' && src[i+1] && src[i+2]) {
             char hex[3] = {src[i+1], src[i+2], 0};
-            dst[j++] = (char)strtol(hex, NULL, 16);
+            char *endptr = NULL;
+            long val = strtol(hex, &endptr, 16);
+            if (endptr != hex + 2) { dst[j++] = src[i]; continue; }
+            dst[j++] = (char)val;
             i += 2;
         } else dst[j++] = src[i];
     }
@@ -264,8 +272,9 @@ void captive_portal_start(void)
     esp_wifi_init(&cfg);
 
     wifi_config_t ap_config = {0};
-    strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid));
-    ap_config.ap.ssid_len = strlen(ap_ssid);
+    strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid[sizeof(ap_config.ap.ssid) - 1] = '\0';
+    ap_config.ap.ssid_len = strlen((char *)ap_config.ap.ssid);
     ap_config.ap.channel = PORTAL_AP_CHANNEL;
     ap_config.ap.authmode = WIFI_AUTH_OPEN;
     ap_config.ap.max_connection = PORTAL_MAX_CONN;
