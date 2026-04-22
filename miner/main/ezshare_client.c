@@ -289,6 +289,7 @@ esp_err_t ezshare_file_list_add(ezshare_file_list_t *file_list, const ezshare_fi
     if (!file_list || !file) return ESP_ERR_INVALID_ARG;
     if (file_list->count >= file_list->capacity) {
         size_t new_cap = file_list->capacity * 2;
+        if (new_cap > 4096) return ESP_ERR_NO_MEM;
         ezshare_file_t *new_files = realloc(file_list->files, new_cap * sizeof(ezshare_file_t));
         if (!new_files) return ESP_ERR_NO_MEM;
         file_list->files = new_files;

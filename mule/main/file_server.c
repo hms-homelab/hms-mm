@@ -163,6 +163,9 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
         }
 
         if (strcmp(type->valuestring, "proxy_meta") == 0) {
+            cJSON *meta_id = cJSON_GetObjectItem(msg, "id");
+            if (meta_id && meta_id->valueint != req_id) { cJSON_Delete(msg); continue; }
+
             cJSON *st_j = cJSON_GetObjectItem(msg, "st");
             cJSON *cl_j = cJSON_GetObjectItem(msg, "cl");
             cJSON *ts_j = cJSON_GetObjectItem(msg, "ts");
@@ -173,7 +176,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
 
             if (http_status == 206) {
                 httpd_resp_set_status(req, "206 Partial Content");
-                static char cr_hdr[64];
+                char cr_hdr[64];
                 uint32_t end_byte = range_end > 0 ? range_end
                     : (range_start + cl - 1);
                 if (total_size > 0)
@@ -192,6 +195,9 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
         }
 
         if (strcmp(type->valuestring, "proxy_chunk") == 0) {
+            cJSON *chunk_id = cJSON_GetObjectItem(msg, "id");
+            if (chunk_id && chunk_id->valueint != req_id) { cJSON_Delete(msg); continue; }
+
             cJSON *d_j    = cJSON_GetObjectItem(msg, "d");
             cJSON *last_j = cJSON_GetObjectItem(msg, "last");
             bool is_last = last_j && cJSON_IsTrue(last_j);

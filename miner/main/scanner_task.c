@@ -89,31 +89,31 @@ static void send_proxy_meta(int req_id, uint16_t http_status,
     cJSON_Delete(root);
 }
 
+#define B64_BUF_SIZE ((FILE_CHUNK_SIZE * 4 / 3) + 8)
+static char s_b64_buf[B64_BUF_SIZE];
+
 static esp_err_t send_proxy_chunk(int req_id, size_t seq, bool is_last,
                                    const uint8_t *data, size_t data_len)
 {
     size_t b64_len = 0;
     mbedtls_base64_encode(NULL, 0, &b64_len, data, data_len);
-
-    char *b64_buf = malloc(b64_len + 1);
-    if (!b64_buf) return ESP_ERR_NO_MEM;
+    if (b64_len >= B64_BUF_SIZE) return ESP_ERR_INVALID_SIZE;
 
     size_t actual = 0;
-    mbedtls_base64_encode((unsigned char *)b64_buf, b64_len, &actual, data, data_len);
-    b64_buf[actual] = '\0';
+    mbedtls_base64_encode((unsigned char *)s_b64_buf, b64_len, &actual, data, data_len);
+    s_b64_buf[actual] = '\0';
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "proxy_chunk");
     cJSON_AddNumberToObject(root, "id", req_id);
     cJSON_AddNumberToObject(root, "seq", seq);
     cJSON_AddBoolToObject(root, "last", is_last);
-    cJSON_AddStringToObject(root, "d", b64_buf);
+    cJSON_AddStringToObject(root, "d", s_b64_buf);
 
     char *json = cJSON_PrintUnformatted(root);
     esp_err_t err = ESP_ERR_NO_MEM;
     if (json) { err = uart_send_json(json); free(json); }
 
-    free(b64_buf);
     cJSON_Delete(root);
     return err;
 }
