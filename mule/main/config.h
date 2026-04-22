@@ -3,6 +3,10 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
+// Firmware identity
+#define FW_PROJECT          "hms-mm"
+#define FW_VERSION          "0.2"
+
 // Home WiFi defaults (overridden by NVS if captive portal was used)
 #define HOME_WIFI_SSID_DEFAULT      "your_wifi_ssid"
 #define HOME_WIFI_PASSWORD_DEFAULT  "your_wifi_password"

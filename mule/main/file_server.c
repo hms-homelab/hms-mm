@@ -87,7 +87,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     esp_err_t ret = ESP_FAIL;
     bool chunked_started = false;
 
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_REQ_TIMEOUT_MS + 5000)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
         return ESP_ERR_INVALID_STATE;
@@ -277,8 +277,8 @@ static esp_err_t handle_status(httpd_req_t *req)
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "{\"mode\":\"proxy\",\"wifi\":%s,"
-             "\"uptime\":\"%dh%02dm%02ds\"}",
+             "{\"state\":\"proxy\",\"wifi\":%s,\"mqtt\":false,"
+             "\"uptime\":\"%02d:%02d:%02d\"}",
              wifi_manager_is_connected() ? "true" : "false",
              hrs, mins, secs);
 

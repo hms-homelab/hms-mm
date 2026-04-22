@@ -18,7 +18,7 @@ static const char *TAG = "MAIN";
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== hms-mm miner starting (proxy mode) ===");
+    ESP_LOGI(TAG, "=== %s miner v%s (proxy mode) ===", FW_PROJECT, FW_VERSION);
 
     nvs_config_init();
     uart_handler_init();

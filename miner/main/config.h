@@ -3,6 +3,10 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
+// Firmware identity
+#define FW_PROJECT          "hms-mm"
+#define FW_VERSION          "0.2"
+
 // =============================================================================
 // Miner config — ezShare creds from NVS first, Kconfig fallback
 // =============================================================================
