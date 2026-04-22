@@ -109,6 +109,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     char uart_buf[PROXY_UART_BUF_SIZE];
     uint8_t decode_buf[PROXY_CHUNK_SIZE];
     int parse_failures = 0;
+    int expected_seq = 0;
 
     while (true) {
         int len = uart_receive_json(uart_buf, sizeof(uart_buf), PROXY_REQ_TIMEOUT_MS);
@@ -171,6 +172,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
             cJSON *ts_j = cJSON_GetObjectItem(msg, "ts");
 
             int http_status = st_j ? st_j->valueint : 200;
+            if (http_status < 100 || http_status > 599) http_status = 200;
             uint32_t total_size = ts_j ? (uint32_t)ts_j->valueint : 0;
             uint32_t cl = cl_j ? (uint32_t)cl_j->valueint : 0;
 
@@ -198,9 +200,15 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
             cJSON *chunk_id = cJSON_GetObjectItem(msg, "id");
             if (chunk_id && chunk_id->valueint != req_id) { cJSON_Delete(msg); continue; }
 
+            cJSON *seq_j  = cJSON_GetObjectItem(msg, "seq");
             cJSON *d_j    = cJSON_GetObjectItem(msg, "d");
             cJSON *last_j = cJSON_GetObjectItem(msg, "last");
             bool is_last = last_j && cJSON_IsTrue(last_j);
+
+            if (seq_j && seq_j->valueint != expected_seq) {
+                ESP_LOGW(TAG, "Chunk seq mismatch: expected=%d got=%d",
+                         expected_seq, seq_j->valueint);
+            }
 
             if (!d_j || !cJSON_IsString(d_j)) { cJSON_Delete(msg); continue; }
 
@@ -233,6 +241,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                 ret = ESP_FAIL;
                 goto cleanup;
             }
+            expected_seq++;
 
             if (is_last) {
                 httpd_resp_send_chunk(req, NULL, 0);

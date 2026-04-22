@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_http_server.h"
 #include "uart_handler.h"
 #include "wifi_manager.h"
@@ -70,6 +71,10 @@ void app_main(void)
     if (httpd_start(&server, &http_cfg) == ESP_OK) {
         file_server_register(server);
         ESP_LOGI(TAG, "HTTP proxy server started on port 80");
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTP server — rebooting");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
     }
 
     mule_task_init();

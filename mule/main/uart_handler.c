@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -15,6 +16,7 @@
 
 static const char *TAG = LOG_TAG_UART;
 static QueueHandle_t uart_queue = NULL;
+static SemaphoreHandle_t uart_mutex = NULL;
 static bool uart_initialized = false;
 
 /**
@@ -62,6 +64,8 @@ esp_err_t uart_handler_init(void) {
         return ret;
     }
 
+    if (!uart_mutex) uart_mutex = xSemaphoreCreateMutex();
+
     uart_initialized = true;
     ESP_LOGI(TAG, "UART initialized successfully (TX: GPIO%d, RX: GPIO%d, Baud: %d)",
              UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
@@ -91,10 +95,13 @@ esp_err_t uart_send_json(const char *json_str) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (uart_mutex) xSemaphoreTake(uart_mutex, portMAX_DELAY);
+
     // Send JSON string
     int written = uart_write_bytes(UART_PORT_NUM, json_str, len);
     if (written < 0) {
         ESP_LOGE(TAG, "Failed to write UART bytes");
+        if (uart_mutex) xSemaphoreGive(uart_mutex);
         return ESP_FAIL;
     }
 
@@ -102,11 +109,14 @@ esp_err_t uart_send_json(const char *json_str) {
     written = uart_write_bytes(UART_PORT_NUM, "\n", 1);
     if (written < 0) {
         ESP_LOGE(TAG, "Failed to write newline");
+        if (uart_mutex) xSemaphoreGive(uart_mutex);
         return ESP_FAIL;
     }
 
     // Wait for transmission to complete
     uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
+
+    if (uart_mutex) xSemaphoreGive(uart_mutex);
 
     ESP_LOGD(TAG, "Sent JSON (%d bytes): %.100s...", len, json_str);
     return ESP_OK;
