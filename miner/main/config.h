@@ -35,9 +35,13 @@
 #define SCANNER_POLL_INTERVAL_MS    100
 #define SCANNER_RETRY_DELAY_MS      10000
 
+// Streaming chunk configuration
+#define FILE_CHUNK_SIZE             4096
+#define PROXY_UART_BUF_SIZE         8192
+#define PROXY_IDLE_TIMEOUT_MS       300000  // 5 min — disconnect ezShare after idle
+
 // Memory
 #define MAX_FILES_PER_SCAN          10
-#define MAX_FILE_SIZE               (2 * 1024 * 1024)
 #define MAX_FILENAME_LEN            256
 #define MAX_DATE_FOLDERS            10
 #define JSON_BUFFER_SIZE            4096

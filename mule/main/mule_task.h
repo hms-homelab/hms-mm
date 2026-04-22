@@ -3,11 +3,7 @@
 #include "esp_err.h"
 
 typedef enum {
-    MULE_IDLE,          // Waiting for collection interval
-    MULE_REQUESTING,    // Sent get_latest_req to miner
-    MULE_RECEIVING,     // Receiving files from miner via UART
-    MULE_DECODING,      // Base64 decoding received files into cache
-    MULE_ERROR
+    MULE_IDLE
 } mule_state_t;
 
 esp_err_t mule_task_init(void);

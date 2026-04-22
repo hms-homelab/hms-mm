@@ -3,10 +3,6 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
-// =============================================================================
-// Mule config — home WiFi from NVS first, Kconfig fallback
-// =============================================================================
-
 // Home WiFi defaults (overridden by NVS if captive portal was used)
 #define HOME_WIFI_SSID_DEFAULT      "your_wifi_ssid"
 #define HOME_WIFI_PASSWORD_DEFAULT  "your_wifi_password"
@@ -18,21 +14,19 @@
 #define UART_BAUD_RATE              115200
 #define UART_TX_PIN                 GPIO_NUM_20
 #define UART_RX_PIN                 GPIO_NUM_21
-#define UART_RX_BUFFER_SIZE         65536   // 64 KB for large file transfers
+#define UART_RX_BUFFER_SIZE         8192
 #define UART_TX_BUFFER_SIZE         8192
 #define UART_QUEUE_SIZE             20
 
-// Mule task
-#define MULE_TASK_STACK_SIZE        12288
+// Mule task (boot-time config only)
+#define MULE_TASK_STACK_SIZE        8192
 #define MULE_TASK_PRIORITY          5
-#define MULE_POLL_INTERVAL_MS       100
-#define MULE_COLLECTION_INTERVAL_SEC 300    // Request files every 5 minutes
-#define MULE_BOOT_DELAY_SEC         30      // Wait after boot before first collection
-#define MULE_MAX_AGE_HOURS          24
+#define MULE_BOOT_DELAY_SEC         5
 
-// File cache
-#define FILE_CACHE_MAX_FILES        64
-#define FILE_CACHE_MAX_TOTAL_BYTES  (4 * 1024 * 1024)  // 4 MB
+// Proxy configuration
+#define PROXY_CHUNK_SIZE            4096
+#define PROXY_UART_BUF_SIZE         8192
+#define PROXY_REQ_TIMEOUT_MS        60000   // per-chunk UART receive timeout
 
 // Captive portal
 #define PORTAL_AP_CHANNEL           1

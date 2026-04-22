@@ -5,7 +5,6 @@ idf_component_register(
         "uart_handler.c"
         "nvs_config.c"
         "captive_portal.c"
-        "file_cache.c"
         "file_server.c"
         "mule_task.c"
     INCLUDE_DIRS "."

@@ -1,15 +1,15 @@
 /**
  * @file scanner_task.c
- * @brief Miner state machine — downloads files from ezShare, sends via UART.
- *        Handles set_config from mule to store ezShare creds in NVS.
+ * @brief Miner proxy handler — receives proxy_req via UART, streams
+ *        chunks from ezShare back as JSON+base64 over UART.
  */
 
 #include <string.h>
-#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "scanner_task.h"
@@ -25,224 +25,264 @@ static TaskHandle_t scanner_task_handle = NULL;
 static bool task_running = false;
 static scanner_state_t current_state = SCANNER_IDLE;
 
-static char requested_timestamp[32] = {0};
-static time_t requested_timestamp_unix = 0;
-static ezshare_file_list_t file_list = {0};
-
-// Active ezShare creds (loaded from NVS or defaults at boot)
 static char ez_ssid[33] = {0};
 static char ez_pass[65] = {0};
+
+static int64_t last_proxy_time_us = 0;
+
+/* Current proxy request */
+static int proxy_req_id = 0;
+static char proxy_path[512] = {0};
+static uint32_t proxy_range_start = 0;
+static uint32_t proxy_range_end = 0;
+
+typedef struct {
+    int req_id;
+    uint16_t http_status;
+    uint32_t content_length;
+    uint32_t range_start;
+    uint32_t range_end;
+    bool meta_sent;
+    bool error;
+} proxy_ctx_t;
 
 void scanner_task_load_ezshare_creds(void)
 {
     if (nvs_config_has_ezshare()) {
         nvs_config_get_ezshare_ssid(ez_ssid, sizeof(ez_ssid));
         nvs_config_get_ezshare_pass(ez_pass, sizeof(ez_pass));
-        ESP_LOGI(TAG, "Using NVS ezShare creds (SSID: %s)", ez_ssid);
+        ESP_LOGI(TAG, "NVS ezShare creds (SSID: %s)", ez_ssid);
     } else {
         strncpy(ez_ssid, EZSHARE_WIFI_SSID_DEFAULT, sizeof(ez_ssid));
         strncpy(ez_pass, EZSHARE_WIFI_PASSWORD_DEFAULT, sizeof(ez_pass));
-        ESP_LOGI(TAG, "Using default ezShare creds (SSID: %s)", ez_ssid);
+        ESP_LOGI(TAG, "Default ezShare creds (SSID: %s)", ez_ssid);
     }
 }
 
-static time_t parse_iso8601_timestamp(const char *timestamp_str)
-{
-    struct tm tm = {0};
-    if (sscanf(timestamp_str, "%d-%d-%dT%d:%d:%d",
-               &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) {
-        return 0;
-    }
-    tm.tm_year -= 1900;
-    tm.tm_mon -= 1;
-    return mktime(&tm);
-}
+/* ── UART JSON helpers ─────────────────────────────────────────── */
 
-static void send_error_message(const char *error_msg, const char *error_code)
+static void send_error_json(int req_id, const char *message, const char *code)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "error");
-    cJSON_AddStringToObject(root, "message", error_msg);
-    cJSON_AddStringToObject(root, "code", error_code);
-    char *json_str = cJSON_PrintUnformatted(root);
-    if (json_str) { uart_send_json(json_str); free(json_str); }
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddStringToObject(root, "message", message);
+    cJSON_AddStringToObject(root, "code", code);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
     cJSON_Delete(root);
 }
 
-static esp_err_t send_file_via_uart(const ezshare_file_t *file)
+static void send_proxy_meta(int req_id, uint16_t http_status,
+                             uint32_t content_length, uint32_t total_size)
 {
-    size_t base64_len = 0;
-    mbedtls_base64_encode(NULL, 0, &base64_len, file->content, file->size);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "proxy_meta");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddNumberToObject(root, "st", http_status);
+    cJSON_AddNumberToObject(root, "cl", content_length);
+    cJSON_AddNumberToObject(root, "ts", total_size);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
 
-    char *base64_content = malloc(base64_len + 1);
-    if (!base64_content) return ESP_ERR_NO_MEM;
+static esp_err_t send_proxy_chunk(int req_id, size_t seq, bool is_last,
+                                   const uint8_t *data, size_t data_len)
+{
+    size_t b64_len = 0;
+    mbedtls_base64_encode(NULL, 0, &b64_len, data, data_len);
 
-    size_t actual_len = 0;
-    if (mbedtls_base64_encode((unsigned char *)base64_content, base64_len,
-                               &actual_len, file->content, file->size) != 0) {
-        free(base64_content);
-        return ESP_FAIL;
-    }
-    base64_content[actual_len] = '\0';
+    char *b64_buf = malloc(b64_len + 1);
+    if (!b64_buf) return ESP_ERR_NO_MEM;
+
+    size_t actual = 0;
+    mbedtls_base64_encode((unsigned char *)b64_buf, b64_len, &actual, data, data_len);
+    b64_buf[actual] = '\0';
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "file_data");
-    cJSON_AddStringToObject(root, "path", file->path);
-    cJSON_AddNumberToObject(root, "size", file->size);
-    cJSON_AddStringToObject(root, "content_base64", base64_content);
+    cJSON_AddStringToObject(root, "type", "proxy_chunk");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddNumberToObject(root, "seq", seq);
+    cJSON_AddBoolToObject(root, "last", is_last);
+    cJSON_AddStringToObject(root, "d", b64_buf);
 
-    char *json_str = cJSON_PrintUnformatted(root);
+    char *json = cJSON_PrintUnformatted(root);
     esp_err_t err = ESP_ERR_NO_MEM;
-    if (json_str) { err = uart_send_json(json_str); free(json_str); }
+    if (json) { err = uart_send_json(json); free(json); }
 
-    free(base64_content);
+    free(b64_buf);
     cJSON_Delete(root);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Sent file: %s (%d bytes)", file->path, file->size);
-    }
     return err;
 }
 
-static void send_file_array_complete(void)
-{
-    size_t total_bytes = 0;
-    for (size_t i = 0; i < file_list.count; i++) total_bytes += file_list.files[i].size;
+/* ── Chunk callback — sends meta + chunks over UART ────────────── */
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "file_array_complete");
-    cJSON_AddNumberToObject(root, "count", file_list.count);
-    cJSON_AddNumberToObject(root, "total_bytes", total_bytes);
-    char *json_str = cJSON_PrintUnformatted(root);
-    if (json_str) { uart_send_json(json_str); free(json_str); }
-    cJSON_Delete(root);
+static esp_err_t proxy_chunk_callback(const uint8_t *data, size_t len,
+                                       size_t seq, bool is_last, void *ctx)
+{
+    proxy_ctx_t *pctx = (proxy_ctx_t *)ctx;
+
+    if (!pctx->meta_sent) {
+        uint32_t total_size;
+        if (pctx->http_status == 206 && pctx->range_end == 0)
+            total_size = pctx->range_start + pctx->content_length;
+        else if (pctx->http_status == 206)
+            total_size = 0;
+        else
+            total_size = pctx->content_length;
+
+        send_proxy_meta(pctx->req_id, pctx->http_status,
+                        pctx->content_length, total_size);
+        pctx->meta_sent = true;
+    }
+
+    esp_err_t err = send_proxy_chunk(pctx->req_id, seq, is_last, data, len);
+    if (err != ESP_OK) {
+        pctx->error = true;
+        return err;
+    }
+
+    ESP_LOGD(TAG, "chunk %zu sent (%zu bytes, last=%d)", seq, len, (int)is_last);
+    return ESP_OK;
 }
 
-/**
- * Handle set_config from mule: store ezShare creds in NVS and reboot.
- */
+/* ── WiFi management with idle timeout ─────────────────────────── */
+
+static bool ensure_ezshare_connected(void)
+{
+    if (wifi_manager_is_connected()) return true;
+
+    ESP_LOGI(TAG, "Connecting to ezShare (%s)...", ez_ssid);
+    if (wifi_manager_connect(ez_ssid, ez_pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
+        ezshare_client_init();
+        return true;
+    }
+    ESP_LOGE(TAG, "ezShare WiFi connect failed");
+    return false;
+}
+
+static void check_idle_disconnect(void)
+{
+    if (!wifi_manager_is_connected()) return;
+    if (last_proxy_time_us == 0) return;
+
+    int64_t elapsed_ms = (esp_timer_get_time() - last_proxy_time_us) / 1000;
+    if (elapsed_ms > PROXY_IDLE_TIMEOUT_MS) {
+        ESP_LOGI(TAG, "Idle timeout — disconnecting from ezShare");
+        wifi_manager_disconnect();
+        last_proxy_time_us = 0;
+    }
+}
+
+/* ── Handle set_config from mule ───────────────────────────────── */
+
 static void handle_set_config(cJSON *root)
 {
-    cJSON *ez_ssid_j = cJSON_GetObjectItem(root, "ez_ssid");
-    cJSON *ez_pass_j = cJSON_GetObjectItem(root, "ez_pass");
+    cJSON *ssid_j = cJSON_GetObjectItem(root, "ez_ssid");
+    cJSON *pass_j = cJSON_GetObjectItem(root, "ez_pass");
 
-    if (ez_ssid_j && cJSON_IsString(ez_ssid_j)) {
-        const char *new_ssid = ez_ssid_j->valuestring;
-        const char *new_pass = (ez_pass_j && cJSON_IsString(ez_pass_j))
-                               ? ez_pass_j->valuestring : "";
+    if (ssid_j && cJSON_IsString(ssid_j)) {
+        const char *new_pass = (pass_j && cJSON_IsString(pass_j)) ? pass_j->valuestring : "";
+        nvs_config_set_ezshare(ssid_j->valuestring, new_pass);
+        ESP_LOGI(TAG, "set_config: SSID=%s", ssid_j->valuestring);
 
-        nvs_config_set_ezshare(new_ssid, new_pass);
-        ESP_LOGI(TAG, "Received set_config from mule — ezShare SSID: %s", new_ssid);
-
-        // ACK back to mule
         cJSON *ack = cJSON_CreateObject();
         cJSON_AddStringToObject(ack, "type", "config_ack");
         cJSON_AddStringToObject(ack, "status", "ok");
-        char *json_str = cJSON_PrintUnformatted(ack);
-        if (json_str) { uart_send_json(json_str); free(json_str); }
+        char *json = cJSON_PrintUnformatted(ack);
+        if (json) { uart_send_json(json); free(json); }
         cJSON_Delete(ack);
 
-        // Delay then reboot
         vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGI(TAG, "Rebooting with new ezShare credentials...");
         esp_restart();
     }
 }
 
+/* ── Main loop ─────────────────────────────────────────────────── */
+
 static void scanner_task_loop(void *pvParameters)
 {
-    char uart_buffer[JSON_BUFFER_SIZE];
-    char date_folders[MAX_DATE_FOLDERS][16];
-    size_t folder_count = 0;
+    char uart_buf[JSON_BUFFER_SIZE];
 
     while (task_running) {
         switch (current_state) {
             case SCANNER_IDLE: {
-                int len = uart_receive_json(uart_buffer, sizeof(uart_buffer), 1000);
-                if (len > 0) {
-                    cJSON *root = cJSON_Parse(uart_buffer);
-                    if (root) {
-                        cJSON *type = cJSON_GetObjectItem(root, "type");
-                        if (type && cJSON_IsString(type)) {
-                            if (strcmp(type->valuestring, "set_config") == 0) {
-                                handle_set_config(root);
-                            } else if (strcmp(type->valuestring, "timestamp_req") == 0) {
-                                cJSON *ts = cJSON_GetObjectItem(root, "timestamp");
-                                if (ts && cJSON_IsString(ts)) {
-                                    strncpy(requested_timestamp, ts->valuestring,
-                                            sizeof(requested_timestamp) - 1);
-                                    requested_timestamp_unix = parse_iso8601_timestamp(ts->valuestring);
-                                    current_state = SCANNER_CONNECTING;
-                                }
-                            } else if (strcmp(type->valuestring, "get_latest_req") == 0) {
-                                cJSON *max_age = cJSON_GetObjectItem(root, "max_age_hours");
-                                int hours = max_age ? max_age->valueint : 24;
-                                requested_timestamp_unix = time(NULL) - (hours * 3600);
-                                current_state = SCANNER_CONNECTING;
-                            }
-                        }
-                        cJSON_Delete(root);
+                check_idle_disconnect();
+
+                int len = uart_receive_json(uart_buf, sizeof(uart_buf), 1000);
+                if (len <= 0) {
+                    vTaskDelay(pdMS_TO_TICKS(SCANNER_POLL_INTERVAL_MS));
+                    break;
+                }
+
+                cJSON *root = cJSON_Parse(uart_buf);
+                if (!root) break;
+
+                cJSON *type = cJSON_GetObjectItem(root, "type");
+                if (!type || !cJSON_IsString(type)) { cJSON_Delete(root); break; }
+
+                if (strcmp(type->valuestring, "set_config") == 0) {
+                    handle_set_config(root);
+                } else if (strcmp(type->valuestring, "proxy_req") == 0) {
+                    cJSON *id_j   = cJSON_GetObjectItem(root, "id");
+                    cJSON *path_j = cJSON_GetObjectItem(root, "path");
+                    cJSON *rs_j   = cJSON_GetObjectItem(root, "rs");
+                    cJSON *re_j   = cJSON_GetObjectItem(root, "re");
+
+                    if (id_j && path_j && cJSON_IsString(path_j)) {
+                        proxy_req_id = id_j->valueint;
+                        strncpy(proxy_path, path_j->valuestring, sizeof(proxy_path) - 1);
+                        proxy_range_start = rs_j ? (uint32_t)rs_j->valueint : 0;
+                        proxy_range_end   = re_j ? (uint32_t)re_j->valueint : 0;
+
+                        ESP_LOGI(TAG, "proxy_req id=%d path=%s range=%lu-%lu",
+                                 proxy_req_id, proxy_path,
+                                 (unsigned long)proxy_range_start,
+                                 (unsigned long)proxy_range_end);
+                        current_state = SCANNER_PROXY;
                     }
                 }
-                vTaskDelay(pdMS_TO_TICKS(SCANNER_POLL_INTERVAL_MS));
+
+                cJSON_Delete(root);
                 break;
             }
 
-            case SCANNER_CONNECTING:
-                ESP_LOGI(TAG, "Connecting to ezShare WiFi (%s)...", ez_ssid);
-                if (wifi_manager_connect(ez_ssid, ez_pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
-                    current_state = SCANNER_LISTING;
-                } else {
-                    send_error_message("Failed to connect to ezShare WiFi", "WIFI_CONNECT_FAILED");
-                    current_state = SCANNER_ERROR;
-                }
-                break;
-
-            case SCANNER_LISTING:
-                if (ezshare_list_date_folders(date_folders, MAX_DATE_FOLDERS, &folder_count) != ESP_OK) {
-                    send_error_message("Failed to list date folders", "HTTP_REQUEST_FAILED");
+            case SCANNER_PROXY: {
+                if (!ensure_ezshare_connected()) {
+                    send_error_json(proxy_req_id, "ezShare unreachable", "WIFI_FAILED");
                     current_state = SCANNER_ERROR;
                     break;
                 }
-                ezshare_file_list_init(&file_list, 10);
-                for (size_t i = 0; i < folder_count; i++) {
-                    ezshare_list_files(date_folders[i], &file_list, requested_timestamp_unix);
-                }
-                current_state = (file_list.count > 0) ? SCANNER_DOWNLOADING : SCANNER_DISCONNECTING;
-                break;
 
-            case SCANNER_DOWNLOADING:
-                for (size_t i = 0; i < file_list.count; i++) {
-                    uint8_t *content = NULL;
-                    size_t size = 0;
-                    if (ezshare_download_file(file_list.files[i].path, &content, &size) == ESP_OK) {
-                        file_list.files[i].content = content;
-                        file_list.files[i].size = size;
-                    }
-                }
-                current_state = SCANNER_SENDING;
-                break;
+                proxy_ctx_t pctx = {
+                    .req_id = proxy_req_id,
+                    .http_status = 0,
+                    .content_length = 0,
+                    .range_start = proxy_range_start,
+                    .range_end = proxy_range_end,
+                    .meta_sent = false,
+                    .error = false,
+                };
 
-            case SCANNER_SENDING:
-                for (size_t i = 0; i < file_list.count; i++) {
-                    if (file_list.files[i].content) {
-                        send_file_via_uart(&file_list.files[i]);
-                    }
-                }
-                send_file_array_complete();
-                current_state = SCANNER_DISCONNECTING;
-                break;
+                esp_err_t err = ezshare_raw_get_range(
+                    proxy_path, FILE_CHUNK_SIZE,
+                    proxy_range_start, proxy_range_end,
+                    &pctx.http_status, &pctx.content_length,
+                    proxy_chunk_callback, &pctx);
 
-            case SCANNER_DISCONNECTING:
-                wifi_manager_disconnect();
-                ezshare_file_list_free(&file_list);
+                if (err != ESP_OK || pctx.error) {
+                    ESP_LOGE(TAG, "proxy failed: %s", esp_err_to_name(err));
+                    if (!pctx.meta_sent)
+                        send_error_json(proxy_req_id, "ezShare request failed", "HTTP_FAILED");
+                }
+
+                last_proxy_time_us = esp_timer_get_time();
                 current_state = SCANNER_IDLE;
                 break;
+            }
 
             case SCANNER_ERROR:
-                if (wifi_manager_is_connected()) wifi_manager_disconnect();
-                if (file_list.files) ezshare_file_list_free(&file_list);
                 vTaskDelay(pdMS_TO_TICKS(SCANNER_RETRY_DELAY_MS));
                 current_state = SCANNER_IDLE;
                 break;
@@ -271,12 +311,5 @@ esp_err_t scanner_task_start(void)
     return ESP_OK;
 }
 
-void scanner_task_stop(void)
-{
-    task_running = false;
-}
-
-scanner_state_t scanner_task_get_state(void)
-{
-    return current_state;
-}
+void scanner_task_stop(void) { task_running = false; }
+scanner_state_t scanner_task_get_state(void) { return current_state; }

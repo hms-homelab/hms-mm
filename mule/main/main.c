@@ -1,16 +1,12 @@
 /**
  * @file main.c
- * @brief Mule — receives files from miner via UART, serves via HTTP.
+ * @brief Mule — proxies HTTP requests to miner via UART.
  *
  * Boot flow:
  *   1. NVS init
- *   2. UART init (needed for captive portal to send creds to miner)
- *   3. Check NVS for home WiFi creds
- *      - If NVS has creds -> connect
- *      - Else if Kconfig defaults are set -> connect
- *      - Else -> captive portal (collects home WiFi + ezShare, sends ezShare to miner, reboots)
- *   4. If connect fails with NVS creds -> clear NVS, reboot into portal
- *   5. Start HTTP file server + mule task
+ *   2. UART init
+ *   3. WiFi: NVS -> Kconfig -> captive portal
+ *   4. Start HTTP proxy server + mule task (sends ezShare config to miner)
  */
 
 #include <stdio.h>
@@ -23,7 +19,6 @@
 #include "wifi_manager.h"
 #include "nvs_config.h"
 #include "captive_portal.h"
-#include "file_cache.h"
 #include "file_server.h"
 #include "mule_task.h"
 #include "config.h"
@@ -32,16 +27,11 @@ static const char *TAG = "MAIN";
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== hms-mm mule starting ===");
+    ESP_LOGI(TAG, "=== hms-mm mule starting (proxy mode) ===");
 
-    // NVS
     nvs_config_init();
-
-    // UART (must be up before captive portal — portal sends ezShare creds to miner)
     uart_handler_init();
-    ESP_LOGI(TAG, "UART: TX=GPIO%d, RX=GPIO%d", UART_TX_PIN, UART_RX_PIN);
 
-    // WiFi: NVS -> Kconfig -> captive portal
     char ssid[33] = {0}, pass[65] = {0};
     bool wifi_ok = false;
 
@@ -49,13 +39,9 @@ void app_main(void)
         nvs_config_get_wifi_ssid(ssid, sizeof(ssid));
         nvs_config_get_wifi_pass(pass, sizeof(pass));
         ESP_LOGI(TAG, "Using NVS WiFi (SSID: %s)", ssid);
-
         wifi_manager_init();
         wifi_ok = (wifi_manager_connect(ssid, pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK);
-
         if (!wifi_ok) {
-            ESP_LOGW(TAG, "NVS WiFi failed, starting captive portal");
-            // Don't clear NVS here — let user re-enter via portal
             captive_portal_start();
             return;
         }
@@ -66,40 +52,33 @@ void app_main(void)
         wifi_ok = (wifi_manager_connect(HOME_WIFI_SSID_DEFAULT, HOME_WIFI_PASSWORD_DEFAULT,
                                          WIFI_CONNECT_TIMEOUT_MS) == ESP_OK);
         if (!wifi_ok) {
-            ESP_LOGW(TAG, "Kconfig WiFi failed, starting captive portal");
             captive_portal_start();
             return;
         }
     } else {
-        ESP_LOGI(TAG, "No WiFi credentials, starting captive portal");
         captive_portal_start();
         return;
     }
 
-    // WiFi connected — start HTTP server
+    file_server_init();
+
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
     http_cfg.max_uri_handlers = 8;
+    http_cfg.stack_size = 8192;
+    http_cfg.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &http_cfg) == ESP_OK) {
         file_server_register(server);
-        ESP_LOGI(TAG, "HTTP file server started on port 80");
+        ESP_LOGI(TAG, "HTTP proxy server started on port 80");
     }
 
-    // Start mule task (periodic file collection from miner)
     mule_task_init();
     mule_task_start();
 
-    ESP_LOGI(TAG, "=== mule running — serving files + collecting from miner ===");
+    ESP_LOGI(TAG, "=== mule running — proxy mode ===");
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-        mule_state_t state = mule_task_get_state();
-        const char *s = (state == MULE_IDLE) ? "IDLE" :
-                        (state == MULE_REQUESTING) ? "REQUESTING" :
-                        (state == MULE_RECEIVING) ? "RECEIVING" :
-                        (state == MULE_DECODING) ? "DECODING" : "ERROR";
-        ESP_LOGI(TAG, "State: %s | WiFi: %s | Cache: %zu files",
-                 s, wifi_manager_is_connected() ? "OK" : "DOWN",
-                 file_cache_count());
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        ESP_LOGI(TAG, "WiFi: %s", wifi_manager_is_connected() ? "OK" : "DOWN");
     }
 }

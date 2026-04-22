@@ -15,4 +15,5 @@ idf_component_register(
         json
     PRIV_REQUIRES
         mbedtls
+        esp_timer
 )

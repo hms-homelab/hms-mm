@@ -1,7 +1,7 @@
 #pragma once
 
 #define VERSION_YEAR    2026
-#define VERSION_MINOR   0
+#define VERSION_MINOR   1
 #define VERSION_PATCH   0
 
 #define _STRINGIFY(x) #x
