@@ -260,6 +260,255 @@ cleanup:
     return ret;
 }
 
+/* ── O2Ring helpers ───────────────────────────────────────────── */
+
+static esp_err_t send_o2ring_req(int req_id, const char *cmd, const char *filename)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "o2ring_req");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddStringToObject(root, "cmd", cmd);
+    if (filename)
+        cJSON_AddStringToObject(root, "name", filename);
+    char *json = cJSON_PrintUnformatted(root);
+    esp_err_t err = ESP_ERR_NO_MEM;
+    if (json) { err = uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+    return err;
+}
+
+static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
+                                         const char *expected_type,
+                                         uint32_t timeout_ms)
+{
+    char uart_buf[JSON_BUFFER_SIZE];
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+
+    while (esp_timer_get_time() < deadline) {
+        uint32_t remaining_ms = (uint32_t)((deadline - esp_timer_get_time()) / 1000);
+        if (remaining_ms == 0) break;
+        if (remaining_ms > timeout_ms) remaining_ms = timeout_ms;
+
+        int len = uart_receive_json(uart_buf, sizeof(uart_buf), remaining_ms);
+        if (len <= 0) continue;
+
+        cJSON *msg = cJSON_Parse(uart_buf);
+        if (!msg) continue;
+
+        cJSON *id_j = cJSON_GetObjectItem(msg, "id");
+        if (!id_j || id_j->valueint != req_id) { cJSON_Delete(msg); continue; }
+
+        cJSON *type = cJSON_GetObjectItem(msg, "type");
+        if (!type || !cJSON_IsString(type)) { cJSON_Delete(msg); continue; }
+
+        if (strcmp(type->valuestring, "error") == 0) {
+            httpd_resp_set_status(req, "502 Bad Gateway");
+            httpd_resp_set_type(req, "application/json");
+            char *err_json = cJSON_PrintUnformatted(msg);
+            if (err_json) { httpd_resp_sendstr(req, err_json); free(err_json); }
+            else httpd_resp_send(req, "{\"error\":\"unknown\"}", HTTPD_RESP_USE_STRLEN);
+            cJSON_Delete(msg);
+            return NULL;
+        }
+
+        if (strcmp(type->valuestring, expected_type) == 0) {
+            return msg; // caller frees
+        }
+
+        cJSON_Delete(msg);
+    }
+
+    httpd_resp_set_status(req, "504 Gateway Timeout");
+    httpd_resp_send(req, "O2Ring timeout", HTTPD_RESP_USE_STRLEN);
+    return NULL;
+}
+
+/* ── O2Ring HTTP handlers ─────────────────────────────────────── */
+
+static esp_err_t handle_o2ring_status(httpd_req_t *req)
+{
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
+    }
+    s_req_id++;
+    int req_id = s_req_id;
+
+    if (send_o2ring_req(req_id, "status", NULL) != ESP_OK) {
+        xSemaphoreGive(s_proxy_mutex);
+        httpd_resp_set_status(req, "502 Bad Gateway");
+        return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    cJSON *resp = wait_o2ring_json_response(req, req_id, "o2ring_status", O2RING_STATUS_TIMEOUT_MS);
+    if (resp) {
+        httpd_resp_set_type(req, "application/json");
+        cJSON_DeleteItemFromObject(resp, "type");
+        cJSON_DeleteItemFromObject(resp, "id");
+        char *json = cJSON_PrintUnformatted(resp);
+        if (json) { httpd_resp_sendstr(req, json); free(json); }
+        cJSON_Delete(resp);
+    }
+    xSemaphoreGive(s_proxy_mutex);
+    return ESP_OK;
+}
+
+static esp_err_t handle_o2ring_files(httpd_req_t *req)
+{
+    char query[512] = {0};
+    char name_param[64] = {0};
+    bool has_name = false;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "name", name_param, sizeof(name_param)) == ESP_OK && name_param[0])
+            has_name = true;
+    }
+
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(O2RING_DOWNLOAD_TIMEOUT_MS + 5000)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
+    }
+    s_req_id++;
+    int req_id = s_req_id;
+
+    if (has_name) {
+        /* Download mode — reuse proxy streaming */
+        if (send_o2ring_req(req_id, "download", name_param) != ESP_OK) {
+            xSemaphoreGive(s_proxy_mutex);
+            httpd_resp_set_status(req, "502 Bad Gateway");
+            return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
+        }
+
+        char cd_hdr[128];
+        snprintf(cd_hdr, sizeof(cd_hdr), "attachment; filename=\"%s\"", name_param);
+        httpd_resp_set_hdr(req, "Content-Disposition", cd_hdr);
+
+        /* Stream proxy_meta + proxy_chunks */
+        char uart_buf[PROXY_UART_BUF_SIZE];
+        uint8_t decode_buf[PROXY_CHUNK_SIZE];
+        bool chunked_started = false;
+        int expected_seq = 0;
+
+        while (true) {
+            int len = uart_receive_json(uart_buf, sizeof(uart_buf), O2RING_DOWNLOAD_TIMEOUT_MS);
+            if (len <= 0) {
+                if (!chunked_started) {
+                    httpd_resp_set_status(req, "504 Gateway Timeout");
+                    httpd_resp_send(req, "O2Ring download timeout", HTTPD_RESP_USE_STRLEN);
+                } else {
+                    httpd_resp_send_chunk(req, NULL, 0);
+                }
+                break;
+            }
+
+            cJSON *msg = cJSON_Parse(uart_buf);
+            if (!msg) continue;
+
+            cJSON *type = cJSON_GetObjectItem(msg, "type");
+            if (!type || !cJSON_IsString(type)) { cJSON_Delete(msg); continue; }
+
+            cJSON *id_j = cJSON_GetObjectItem(msg, "id");
+            if (id_j && id_j->valueint != req_id) { cJSON_Delete(msg); continue; }
+
+            if (strcmp(type->valuestring, "error") == 0) {
+                cJSON *em = cJSON_GetObjectItem(msg, "message");
+                if (!chunked_started) {
+                    httpd_resp_set_status(req, "502 Bad Gateway");
+                    httpd_resp_send(req, em ? em->valuestring : "Download error", HTTPD_RESP_USE_STRLEN);
+                } else {
+                    httpd_resp_send_chunk(req, NULL, 0);
+                }
+                cJSON_Delete(msg);
+                break;
+            }
+
+            if (strcmp(type->valuestring, "proxy_meta") == 0) {
+                cJSON_Delete(msg);
+                continue;
+            }
+
+            if (strcmp(type->valuestring, "proxy_chunk") == 0) {
+                cJSON *d_j = cJSON_GetObjectItem(msg, "d");
+                cJSON *last_j = cJSON_GetObjectItem(msg, "last");
+                bool is_last = last_j && cJSON_IsTrue(last_j);
+
+                if (!d_j || !cJSON_IsString(d_j)) { cJSON_Delete(msg); continue; }
+
+                size_t decoded_len = 0;
+                int rc = mbedtls_base64_decode(decode_buf, sizeof(decode_buf), &decoded_len,
+                                                (const unsigned char *)d_j->valuestring,
+                                                strlen(d_j->valuestring));
+                cJSON_Delete(msg);
+
+                if (rc != 0) continue;
+
+                if (!chunked_started) {
+                    httpd_resp_set_type(req, "application/octet-stream");
+                    chunked_started = true;
+                }
+
+                httpd_resp_send_chunk(req, (const char *)decode_buf, decoded_len);
+                expected_seq++;
+
+                if (is_last) {
+                    httpd_resp_send_chunk(req, NULL, 0);
+                    break;
+                }
+                continue;
+            }
+            cJSON_Delete(msg);
+        }
+    } else {
+        /* List mode */
+        if (send_o2ring_req(req_id, "files", NULL) != ESP_OK) {
+            xSemaphoreGive(s_proxy_mutex);
+            httpd_resp_set_status(req, "502 Bad Gateway");
+            return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
+        }
+
+        cJSON *resp = wait_o2ring_json_response(req, req_id, "o2ring_files", O2RING_FILES_TIMEOUT_MS);
+        if (resp) {
+            httpd_resp_set_type(req, "application/json");
+            cJSON_DeleteItemFromObject(resp, "type");
+            cJSON_DeleteItemFromObject(resp, "id");
+            char *json = cJSON_PrintUnformatted(resp);
+            if (json) { httpd_resp_sendstr(req, json); free(json); }
+            cJSON_Delete(resp);
+        }
+    }
+
+    xSemaphoreGive(s_proxy_mutex);
+    return ESP_OK;
+}
+
+static esp_err_t handle_o2ring_live(httpd_req_t *req)
+{
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
+    }
+    s_req_id++;
+    int req_id = s_req_id;
+
+    if (send_o2ring_req(req_id, "live", NULL) != ESP_OK) {
+        xSemaphoreGive(s_proxy_mutex);
+        httpd_resp_set_status(req, "502 Bad Gateway");
+        return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    cJSON *resp = wait_o2ring_json_response(req, req_id, "o2ring_live", O2RING_LIVE_TIMEOUT_MS);
+    if (resp) {
+        httpd_resp_set_type(req, "application/json");
+        cJSON_DeleteItemFromObject(resp, "type");
+        cJSON_DeleteItemFromObject(resp, "id");
+        char *json = cJSON_PrintUnformatted(resp);
+        if (json) { httpd_resp_sendstr(req, json); free(json); }
+        cJSON_Delete(resp);
+    }
+    xSemaphoreGive(s_proxy_mutex);
+    return ESP_OK;
+}
+
 /* ── HTTP handlers ─────────────────────────────────────────────── */
 
 static esp_err_t handle_dir(httpd_req_t *req)
@@ -308,7 +557,7 @@ static esp_err_t handle_status(httpd_req_t *req)
     char buf[256];
     snprintf(buf, sizeof(buf),
              "{\"state\":\"proxy\",\"wifi\":%s,\"mqtt\":false,"
-             "\"uptime\":\"%02d:%02d:%02d\"}",
+             "\"o2ring\":false,\"uptime\":\"%02d:%02d:%02d\"}",
              wifi_manager_is_connected() ? "true" : "false",
              hrs, mins, secs);
 
@@ -319,10 +568,14 @@ static esp_err_t handle_status(httpd_req_t *req)
 void file_server_register(httpd_handle_t server)
 {
     httpd_uri_t uris[] = {
-        { .uri = "/dir",        .method = HTTP_GET, .handler = handle_dir },
-        { .uri = "/download",   .method = HTTP_GET, .handler = handle_download },
-        { .uri = "/api/status", .method = HTTP_GET, .handler = handle_status },
+        { .uri = "/dir",            .method = HTTP_GET, .handler = handle_dir },
+        { .uri = "/download",       .method = HTTP_GET, .handler = handle_download },
+        { .uri = "/api/status",     .method = HTTP_GET, .handler = handle_status },
+        { .uri = "/o2ring/status",  .method = HTTP_GET, .handler = handle_o2ring_status },
+        { .uri = "/o2ring/files",   .method = HTTP_GET, .handler = handle_o2ring_files },
+        { .uri = "/o2ring/live",    .method = HTTP_GET, .handler = handle_o2ring_live },
     };
-    for (int i = 0; i < 3; i++) httpd_register_uri_handler(server, &uris[i]);
-    ESP_LOGI(TAG, "Registered: /dir /download /api/status (proxy mode)");
+    for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++)
+        httpd_register_uri_handler(server, &uris[i]);
+    ESP_LOGI(TAG, "Registered: /dir /download /api/status /o2ring/* (proxy mode)");
 }

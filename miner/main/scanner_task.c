@@ -18,6 +18,7 @@
 #include "ezshare_client.h"
 #include "nvs_config.h"
 #include "config.h"
+#include "o2ring_ble.h"
 
 static const char *TAG = LOG_TAG_SCANNER;
 
@@ -29,6 +30,14 @@ static char ez_ssid[33] = {0};
 static char ez_pass[65] = {0};
 
 static int64_t last_proxy_time_us = 0;
+
+/* O2Ring BLE state */
+static bool s_ble_initialized = false;
+static int o2ring_req_id = 0;
+static char o2ring_cmd[16] = {0};
+static char o2ring_filename[O2RING_MAX_FILENAME] = {0};
+
+#define O2RING_DL_BUF_SIZE (48 * 1024)
 
 /* Current proxy request */
 static int proxy_req_id = 0;
@@ -149,6 +158,100 @@ static esp_err_t proxy_chunk_callback(const uint8_t *data, size_t len,
     return ESP_OK;
 }
 
+/* ── O2Ring JSON helpers ──────────────────────────────────────── */
+
+static void send_o2ring_status(int req_id)
+{
+    const o2ring_device_info_t *info = o2ring_ble_get_info();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "o2ring_status");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddBoolToObject(root, "connected", o2ring_ble_is_connected());
+    cJSON_AddStringToObject(root, "model", info && info->valid ? info->model : "");
+    cJSON_AddStringToObject(root, "serial", info && info->valid ? info->serial : "");
+    cJSON_AddNumberToObject(root, "battery", info && info->valid ? info->battery : 0);
+    cJSON_AddNumberToObject(root, "file_count", info && info->valid ? info->file_count : 0);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
+
+static void send_o2ring_files(int req_id)
+{
+    const o2ring_device_info_t *info = o2ring_ble_get_info();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "o2ring_files");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON *arr = cJSON_AddArrayToObject(root, "files");
+    if (info && info->valid) {
+        for (int i = 0; i < info->file_count; i++) {
+            cJSON_AddItemToArray(arr, cJSON_CreateString(info->files[i].name));
+        }
+        cJSON_AddNumberToObject(root, "battery", info->battery);
+    } else {
+        cJSON_AddNumberToObject(root, "battery", 0);
+    }
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
+
+static void send_o2ring_live(int req_id)
+{
+    const o2ring_live_t *live = o2ring_ble_get_live();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "o2ring_live");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddNumberToObject(root, "spo2", live ? live->spo2 : 0);
+    cJSON_AddNumberToObject(root, "hr", live ? live->hr : 0);
+    cJSON_AddNumberToObject(root, "motion", live ? live->motion : 0);
+    cJSON_AddNumberToObject(root, "vibration", live ? live->vibration : 0);
+    cJSON_AddBoolToObject(root, "valid", live ? live->valid : false);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
+
+/* ── BLE management ──────────────────────────────────────────── */
+
+static bool ensure_ble_ready(int req_id)
+{
+    /* Disconnect WiFi if connected (radio shared on ESP32-C3) */
+    if (wifi_manager_is_connected()) {
+        ESP_LOGI(TAG, "Disconnecting WiFi for BLE");
+        wifi_manager_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!s_ble_initialized) {
+        esp_err_t ret = o2ring_ble_init();
+        if (ret != ESP_OK) {
+            send_error_json(req_id, "BLE init failed", "BLE_INIT_FAIL");
+            return false;
+        }
+        s_ble_initialized = true;
+    }
+
+    if (!o2ring_ble_is_connected()) {
+        o2ring_ble_set_auto_reconnect(true);
+        esp_err_t ret = o2ring_ble_connect_and_wait(O2RING_CONNECT_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            send_error_json(req_id, "O2Ring not found", "BLE_NOT_FOUND");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void release_ble(void)
+{
+    if (!s_ble_initialized) return;
+    o2ring_ble_stop();
+    o2ring_ble_deinit();
+    s_ble_initialized = false;
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
 /* ── WiFi management with idle timeout ─────────────────────────── */
 
 static bool ensure_ezshare_connected(void)
@@ -227,6 +330,26 @@ static void scanner_task_loop(void *pvParameters)
 
                 if (strcmp(type->valuestring, "set_config") == 0) {
                     handle_set_config(root);
+                } else if (strcmp(type->valuestring, "o2ring_req") == 0) {
+                    cJSON *id_j  = cJSON_GetObjectItem(root, "id");
+                    cJSON *cmd_j = cJSON_GetObjectItem(root, "cmd");
+                    cJSON *name_j = cJSON_GetObjectItem(root, "name");
+
+                    if (id_j && cmd_j && cJSON_IsString(cmd_j)) {
+                        o2ring_req_id = id_j->valueint;
+                        strncpy(o2ring_cmd, cmd_j->valuestring, sizeof(o2ring_cmd) - 1);
+                        o2ring_cmd[sizeof(o2ring_cmd) - 1] = '\0';
+                        if (name_j && cJSON_IsString(name_j)) {
+                            strncpy(o2ring_filename, name_j->valuestring, sizeof(o2ring_filename) - 1);
+                            o2ring_filename[sizeof(o2ring_filename) - 1] = '\0';
+                        } else {
+                            o2ring_filename[0] = '\0';
+                        }
+
+                        ESP_LOGI(TAG, "o2ring_req id=%d cmd=%s name=%s",
+                                 o2ring_req_id, o2ring_cmd, o2ring_filename);
+                        current_state = SCANNER_O2RING;
+                    }
                 } else if (strcmp(type->valuestring, "proxy_req") == 0) {
                     cJSON *id_j   = cJSON_GetObjectItem(root, "id");
                     cJSON *path_j = cJSON_GetObjectItem(root, "path");
@@ -253,6 +376,8 @@ static void scanner_task_loop(void *pvParameters)
             }
 
             case SCANNER_PROXY: {
+                release_ble();  /* Free BLE heap before WiFi */
+
                 if (!ensure_ezshare_connected()) {
                     send_error_json(proxy_req_id, "ezShare unreachable", "WIFI_FAILED");
                     current_state = SCANNER_ERROR;
@@ -282,6 +407,80 @@ static void scanner_task_loop(void *pvParameters)
                 }
 
                 last_proxy_time_us = esp_timer_get_time();
+                current_state = SCANNER_IDLE;
+                break;
+            }
+
+            case SCANNER_O2RING: {
+                if (strcmp(o2ring_cmd, "status") == 0) {
+                    /* Status returns cached state — no connection needed */
+                    send_o2ring_status(o2ring_req_id);
+                } else if (strcmp(o2ring_cmd, "files") == 0) {
+                    if (!ensure_ble_ready(o2ring_req_id)) {
+                        current_state = SCANNER_IDLE;
+                        break;
+                    }
+                    esp_err_t ret = o2ring_ble_refresh_info();
+                    if (ret != ESP_OK) {
+                        send_error_json(o2ring_req_id, "Failed to read file list", "BLE_READ_FAIL");
+                    } else {
+                        send_o2ring_files(o2ring_req_id);
+                    }
+                } else if (strcmp(o2ring_cmd, "live") == 0) {
+                    if (!ensure_ble_ready(o2ring_req_id)) {
+                        current_state = SCANNER_IDLE;
+                        break;
+                    }
+                    esp_err_t ret = o2ring_ble_read_sensors();
+                    if (ret != ESP_OK) {
+                        send_error_json(o2ring_req_id, "Failed to read sensors", "BLE_READ_FAIL");
+                    } else {
+                        send_o2ring_live(o2ring_req_id);
+                    }
+                } else if (strcmp(o2ring_cmd, "download") == 0) {
+                    if (!ensure_ble_ready(o2ring_req_id)) {
+                        current_state = SCANNER_IDLE;
+                        break;
+                    }
+                    /* Refresh info to ensure file list is current */
+                    o2ring_ble_refresh_info();
+
+                    /* Heap-allocate download buffer (WiFi is off, ~60KB free) */
+                    uint8_t *dl_buf = malloc(O2RING_DL_BUF_SIZE);
+                    if (!dl_buf) {
+                        send_error_json(o2ring_req_id, "Out of memory", "OOM");
+                        current_state = SCANNER_IDLE;
+                        break;
+                    }
+
+                    size_t out_len = 0;
+                    esp_err_t ret = o2ring_ble_download_file(o2ring_filename, dl_buf,
+                                                             O2RING_DL_BUF_SIZE, &out_len);
+                    if (ret != ESP_OK || out_len == 0) {
+                        send_error_json(o2ring_req_id, "File download failed", "BLE_READ_FAIL");
+                        free(dl_buf);
+                        current_state = SCANNER_IDLE;
+                        break;
+                    }
+
+                    /* Send proxy_meta with actual size, then chunked data */
+                    send_proxy_meta(o2ring_req_id, 200, (uint32_t)out_len, 0);
+
+                    size_t offset = 0;
+                    size_t seq = 0;
+                    while (offset < out_len) {
+                        size_t chunk_len = out_len - offset;
+                        if (chunk_len > FILE_CHUNK_SIZE) chunk_len = FILE_CHUNK_SIZE;
+                        bool is_last = (offset + chunk_len >= out_len);
+                        send_proxy_chunk(o2ring_req_id, seq, is_last,
+                                         dl_buf + offset, chunk_len);
+                        offset += chunk_len;
+                        seq++;
+                    }
+                    free(dl_buf);
+                } else {
+                    send_error_json(o2ring_req_id, "Unknown o2ring command", "INVALID_CMD");
+                }
                 current_state = SCANNER_IDLE;
                 break;
             }

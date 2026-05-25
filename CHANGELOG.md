@@ -2,6 +2,23 @@
 
 Version format: `YYYY.MINOR.PATCH`
 
+## [2026.0.3] - 2026-05-24
+
+### Added — O2Ring BLE oximetry support
+- **Miner BLE client**: ported Wellue O2Ring GATT client from cpapdash-push-c3 (`o2ring_ble.c/h`) — Viatom protocol with CRC-8 framing, 128-bit service/characteristic UUIDs
+- **Scanner O2Ring state**: new `SCANNER_O2RING` state handles `o2ring_req` UART messages with 4 sub-commands: `status`, `files`, `live`, `download`
+- **HTTP endpoints on mule**: `/o2ring/status`, `/o2ring/files`, `/o2ring/files?name=FILE.vld`, `/o2ring/live` — proxied to miner over UART
+- **WiFi/BLE radio sequencing**: miner disconnects WiFi before BLE operations and vice versa (ESP32-C3 shared radio)
+- **Lazy BLE init**: BLE stack only loads on first `o2ring_req`, saving ~50KB heap when O2Ring is not used
+- **File downloads**: O2Ring `.vld` files streamed via existing `proxy_meta` + `proxy_chunk` UART framing
+- **BLE sdkconfig**: enabled Bluedroid stack for miner (`CONFIG_BT_ENABLED`, `CONFIG_BT_BLUEDROID_ENABLED`)
+- Spec document: `docs/o2ring-ble-integration.md`
+
+### Changed
+- `handle_status()` now includes `"o2ring"` field in `/api/status` response
+- URI registration uses `sizeof(uris)/sizeof(uris[0])` instead of hardcoded count
+- Version bumped to 2026.0.3
+
 ## [2026.1.0] - 2026-04-21
 
 ### Changed — Architecture: batch collector to pure proxy

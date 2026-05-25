@@ -5,7 +5,7 @@
 
 // Firmware identity
 #define FW_PROJECT          "hms-mm"
-#define FW_VERSION          "0.2"
+#define FW_VERSION          "2026.0.3"
 
 // =============================================================================
 // Miner config — ezShare creds from NVS first, Kconfig fallback
@@ -50,8 +50,14 @@
 #define MAX_DATE_FOLDERS            10
 #define JSON_BUFFER_SIZE            4096
 
+// O2Ring BLE
+#define O2RING_CONNECT_TIMEOUT_MS   15000
+#define O2RING_CMD_TIMEOUT_MS       10000
+#define O2RING_DOWNLOAD_TIMEOUT_MS  120000
+
 // Log tags
 #define LOG_TAG_SCANNER             "MINER"
 #define LOG_TAG_WIFI                "WIFI"
 #define LOG_TAG_EZSHARE             "EZSHARE"
 #define LOG_TAG_UART                "UART"
+#define LOG_TAG_O2RING              "O2RING"

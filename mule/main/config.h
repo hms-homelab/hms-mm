@@ -5,7 +5,7 @@
 
 // Firmware identity
 #define FW_PROJECT          "hms-mm"
-#define FW_VERSION          "0.2"
+#define FW_VERSION          "2026.0.3"
 
 // Home WiFi defaults (overridden by NVS if captive portal was used)
 #define HOME_WIFI_SSID_DEFAULT      "your_wifi_ssid"
@@ -31,6 +31,12 @@
 #define PROXY_CHUNK_SIZE            4096
 #define PROXY_UART_BUF_SIZE         8192
 #define PROXY_REQ_TIMEOUT_MS        60000   // per-chunk UART receive timeout
+
+// O2Ring UART timeouts (BLE operations are slower than ezShare HTTP)
+#define O2RING_STATUS_TIMEOUT_MS    20000
+#define O2RING_FILES_TIMEOUT_MS     25000
+#define O2RING_LIVE_TIMEOUT_MS      25000
+#define O2RING_DOWNLOAD_TIMEOUT_MS  120000
 
 // Captive portal
 #define PORTAL_AP_CHANNEL           1

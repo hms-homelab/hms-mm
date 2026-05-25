@@ -6,6 +6,7 @@ idf_component_register(
         "uart_handler.c"
         "scanner_task.c"
         "nvs_config.c"
+        "o2ring_ble.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -13,6 +14,7 @@ idf_component_register(
         nvs_flash
         driver
         json
+        bt
     PRIV_REQUIRES
         mbedtls
         esp_timer

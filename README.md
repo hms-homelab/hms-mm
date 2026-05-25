@@ -1,14 +1,11 @@
 # hms-mm
 
-> **EXPERIMENTAL** — This project is in early development (v0.2).
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.x-blue.svg?logo=espressif)](https://docs.espressif.com/projects/esp-idf/)
-[![Status: Experimental](https://img.shields.io/badge/Status-Experimental-orange.svg)]()
 
-Dual ESP32-C3 proxy bridge for WiFi SD cards. The mule connects to your home WiFi and runs an HTTP server. When a client requests a file, the mule forwards the request to the miner over UART. The miner connects to the SD card's WiFi AP, fetches the data, and streams it back chunk by chunk. No caching, no buffering — real-time proxy.
+Dual ESP32-C3 proxy bridge for WiFi SD cards and Wellue O2Ring oximeters. The mule connects to your home WiFi and runs an HTTP server. When a client requests a file, the mule forwards the request to the miner over UART. The miner connects to the SD card's WiFi AP or O2Ring via BLE, fetches the data, and streams it back chunk by chunk.
 
-Solves the "two WiFi networks" problem: WiFi SD cards create their own AP, so a single-radio device can't be on both the SD card's network and your home network simultaneously. Two ESP32-C3s, connected by UART, each handle one network.
+Solves the "two WiFi networks" problem: WiFi SD cards create their own AP, so a single-radio device can't be on both the SD card's network and your home network simultaneously. Two ESP32-C3s, connected by UART, each handle one network. The miner also supports BLE connections to a Wellue O2Ring for oximetry data (SpO2, heart rate, stored session files).
 
 ## Architecture
 
@@ -25,10 +22,13 @@ WiFi SD Card AP          JSON + newline          Home Network
 |  card WiFi on    |  <-- proxy_meta  |  Forwards /dir & |
 |  demand, streams |  <-- proxy_chunk |  /download to    |
 |  chunks back     |                  |  miner via UART  |
+|                  |  o2ring_req -->  |                  |
+|  Connects to     |  <-- o2ring_*   |  /o2ring/* API   |
+|  O2Ring via BLE  |                  |                  |
 +------------------+                  +------------------+
-                                            |
-                                            v  HTTP
-                                      Browser / App
+       ^                                    |
+       |  BLE                               v  HTTP
+  O2 Ring                             Browser / App
 ```
 
 **Request flow:**
@@ -121,6 +121,8 @@ curl -H "Range: bytes=1024-" "http://<MULE_IP>/download?file=STR.EDF" -o str_par
 
 ## HTTP API
 
+### ezShare SD Card
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Redirects to `/dir?dir=A:` |
@@ -131,7 +133,7 @@ curl -H "Range: bytes=1024-" "http://<MULE_IP>/download?file=STR.EDF" -o str_par
 
 **`/api/status` response:**
 ```json
-{"state":"proxy","wifi":true,"mqtt":false,"uptime":"01:23:45"}
+{"state":"proxy","wifi":true,"mqtt":false,"o2ring":false,"uptime":"01:23:45"}
 ```
 
 **`/download` Range support:**
@@ -143,6 +145,36 @@ HTTP/1.1 206 Partial Content
 Content-Range: bytes 1024-2047/75264
 Accept-Ranges: bytes
 ```
+
+### O2Ring Oximetry (BLE)
+
+The miner connects to a [Wellue O2Ring](https://www.wellue.com/o2ring) via BLE. The ring must be in standby mode (off-wrist) for file operations. Live readings require the ring to be on-finger and recording.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/o2ring/status` | GET | BLE connection state + device info |
+| `/o2ring/files` | GET | List stored .vld session files on the ring |
+| `/o2ring/files?name=FILE.vld` | GET | Download a .vld file from the ring |
+| `/o2ring/live` | GET | Live SpO2/HR reading (ring must be on-finger) |
+
+**`/o2ring/status` response:**
+```json
+{"connected":true,"model":"O2Ring","serial":"20243041276","battery":74,"file_count":2}
+```
+
+**`/o2ring/files` response:**
+```json
+{"files":["20260412065307.vld","20260413231500.vld"],"battery":74}
+```
+
+**`/o2ring/live` response:**
+```json
+{"spo2":97,"hr":62,"motion":5,"vibration":0,"valid":true}
+```
+
+**`/o2ring/files?name=...` response:** Binary `.vld` file download (`application/octet-stream`). Typical size: 30-50 KB per 8-hour session. Download time: ~15-30 seconds over BLE.
+
+WiFi and BLE share the ESP32-C3 radio, so they run sequentially — the miner disconnects from ezShare WiFi before starting BLE operations, and reconnects on demand for the next SD card request.
 
 ## UART Protocol
 
@@ -191,6 +223,27 @@ Newline-delimited JSON at 115200 baud.
 {"type":"config_ack","status":"ok"}
 ```
 
+### O2Ring Messages
+
+**O2Ring request (mule -> miner):**
+```json
+{"type":"o2ring_req","id":10,"cmd":"status"}
+{"type":"o2ring_req","id":11,"cmd":"files"}
+{"type":"o2ring_req","id":12,"cmd":"download","name":"20260412065307.vld"}
+{"type":"o2ring_req","id":13,"cmd":"live"}
+```
+- `cmd` — `status`, `files`, `live`, or `download`
+- `name` — filename for download command
+
+**O2Ring responses (miner -> mule):**
+```json
+{"type":"o2ring_status","id":10,"connected":true,"model":"O2Ring","serial":"...","battery":74,"file_count":2}
+{"type":"o2ring_files","id":11,"files":["20260412065307.vld"],"battery":74}
+{"type":"o2ring_live","id":13,"spo2":97,"hr":62,"motion":5,"vibration":0,"valid":true}
+```
+
+File downloads reuse `proxy_meta` + `proxy_chunk` framing (same as ezShare).
+
 ## Credential Priority
 
 | Priority | Source | How to set |
@@ -204,13 +257,14 @@ NVS credentials override compile-time defaults.
 
 ```
 hms-mm/
-  miner/                    # ESP32-C3 #1 (connects to SD card WiFi)
+  miner/                    # ESP32-C3 #1 (connects to SD card WiFi + O2Ring BLE)
     main/
       main.c                # Boot, init, status loop
-      scanner_task.c/h      # UART proxy handler: receive req, fetch, stream chunks
+      scanner_task.c/h      # UART handler: proxy_req, o2ring_req, set_config
       uart_handler.c/h      # UART JSON TX/RX
       wifi_manager.c/h      # WiFi STA (connects to SD card AP on demand)
       ezshare_client.c/h    # HTTP client for SD card with chunked streaming callback
+      o2ring_ble.c/h        # Wellue O2Ring BLE GATT client (Viatom protocol)
       nvs_config.c/h        # NVS storage for SD card WiFi credentials
       config.h              # Pin assignments, timeouts, defaults
     partitions.csv
@@ -221,7 +275,7 @@ hms-mm/
       uart_handler.c/h      # UART JSON TX/RX
       wifi_manager.c/h      # WiFi STA (connects to home network)
       captive_portal.c/h    # AP mode WiFi setup with DNS hijack
-      file_server.c/h       # HTTP proxy server with mutex + Range support
+      file_server.c/h       # HTTP proxy server + O2Ring endpoints
       nvs_config.c/h        # NVS storage for WiFi + SD card credentials
       config.h              # Pin assignments, timeouts, defaults
     partitions.csv
