@@ -2,7 +2,7 @@
  * @file ezshare_client.c
  * @brief Miner HTTP client — streaming downloads with Range support.
  *
- * Ported from cpapdash-push-c3. No file buffering — chunks via callback.
+ * Ported from the upstream C3 project. No file buffering — chunks via callback.
  */
 
 #include <string.h>

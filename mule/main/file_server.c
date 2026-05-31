@@ -106,8 +106,10 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
         goto cleanup;
     }
 
-    char uart_buf[PROXY_UART_BUF_SIZE];
-    uint8_t decode_buf[PROXY_CHUNK_SIZE];
+    /* static, not stack: 8 KB + 4 KB would overflow the 8 KB httpd task stack.
+     * Safe — handlers are serialised by s_proxy_mutex (one client at a time). */
+    static char uart_buf[PROXY_UART_BUF_SIZE];
+    static uint8_t decode_buf[PROXY_CHUNK_SIZE];
     int parse_failures = 0;
     int expected_seq = 0;
 
@@ -281,7 +283,9 @@ static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
                                          const char *expected_type,
                                          uint32_t timeout_ms)
 {
-    char uart_buf[JSON_BUFFER_SIZE];
+    /* static: keep this 4 KB buffer off the 8 KB httpd task stack.
+     * Callers (handle_o2ring_status/live) hold s_proxy_mutex. */
+    static char uart_buf[JSON_BUFFER_SIZE];
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
 
     while (esp_timer_get_time() < deadline) {
@@ -383,9 +387,10 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
         snprintf(cd_hdr, sizeof(cd_hdr), "attachment; filename=\"%s\"", name_param);
         httpd_resp_set_hdr(req, "Content-Disposition", cd_hdr);
 
-        /* Stream proxy_meta + proxy_chunks */
-        char uart_buf[PROXY_UART_BUF_SIZE];
-        uint8_t decode_buf[PROXY_CHUNK_SIZE];
+        /* Stream proxy_meta + proxy_chunks. static, not stack: 8 KB + 4 KB
+         * would overflow the 8 KB httpd task; serialised by s_proxy_mutex. */
+        static char uart_buf[PROXY_UART_BUF_SIZE];
+        static uint8_t decode_buf[PROXY_CHUNK_SIZE];
         bool chunked_started = false;
         int expected_seq = 0;
 

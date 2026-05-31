@@ -2,10 +2,15 @@
 
 Version format: `YYYY.MINOR.PATCH`
 
+## [2026.0.4] - 2026-05-31
+
+### Fixed
+- **httpd task stack overflow in file/O2Ring download handlers.** `handle_download` and `handle_o2ring_files` (download mode) each declared `char uart_buf[PROXY_UART_BUF_SIZE]` (8 KB) + `uint8_t decode_buf[PROXY_CHUNK_SIZE]` (4 KB) as **stack** locals — ~12 KB in the 8 KB httpd task (`main.c` `stack_size = 8192`), guaranteed to overflow and corrupt memory / reset the mule on any download. Moved both buffers (and the 4 KB `uart_buf` in `wait_o2ring_json_response`) to `static` storage; they're only touched while holding `s_proxy_mutex`, so one-at-a-time access keeps them safe. The O2Ring `/status`, `/files` (list), and `/live` endpoints were intact — not removed.
+
 ## [2026.0.3] - 2026-05-24
 
 ### Added — O2Ring BLE oximetry support
-- **Miner BLE client**: ported Wellue O2Ring GATT client from cpapdash-push-c3 (`o2ring_ble.c/h`) — Viatom protocol with CRC-8 framing, 128-bit service/characteristic UUIDs
+- **Miner BLE client**: ported Wellue O2Ring GATT client from the upstream C3 project (`o2ring_ble.c/h`) — Viatom protocol with CRC-8 framing, 128-bit service/characteristic UUIDs
 - **Scanner O2Ring state**: new `SCANNER_O2RING` state handles `o2ring_req` UART messages with 4 sub-commands: `status`, `files`, `live`, `download`
 - **HTTP endpoints on mule**: `/o2ring/status`, `/o2ring/files`, `/o2ring/files?name=FILE.vld`, `/o2ring/live` — proxied to miner over UART
 - **WiFi/BLE radio sequencing**: miner disconnects WiFi before BLE operations and vice versa (ESP32-C3 shared radio)

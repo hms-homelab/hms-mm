@@ -2,7 +2,7 @@
 
 #define VERSION_YEAR    2026
 #define VERSION_MINOR   0
-#define VERSION_PATCH   3
+#define VERSION_PATCH   4
 
 #define _STRINGIFY(x) #x
 #define STRINGIFY(x) _STRINGIFY(x)

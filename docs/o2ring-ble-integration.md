@@ -3,7 +3,7 @@
 **Status:** Draft
 **Date:** 2026-05-24
 **Affects:** hms-mm (miner + mule firmware)
-**Reference:** cpapdash-push-c3 O2Ring implementation (`miner/main/o2ring_ble.c`)
+**Reference:** the upstream C3 project O2Ring implementation (`miner/main/o2ring_ble.c`)
 
 ## Problem
 
@@ -20,7 +20,7 @@ Add O2Ring BLE to the **miner** ESP32-C3. The miner becomes a dual-source collec
 - The mule runs home WiFi + HTTP server — adding BLE would contend for heap (~50KB BLE + ~30KB WiFi + HTTP overhead).
 - The miner is idle between proxy requests — plenty of free heap for BLE.
 - WiFi and BLE share the ESP32-C3 radio. The miner can sequence them: WiFi off -> BLE on -> read O2Ring -> BLE off -> WiFi available again. No concurrent radio use.
-- Same rationale as cpapdash-push-c3 SDD-002.
+- Same rationale as the upstream C3 project's BLE-on-miner design.
 
 ### Architecture
 
@@ -58,7 +58,7 @@ The ezShare WiFi idle timeout (5 min) naturally disconnects WiFi between proxy b
 
 ## BLE Protocol (Viatom)
 
-Ported directly from cpapdash-push-c3 `o2ring_ble.c`. No changes to the BLE layer.
+Ported directly from the upstream C3 project `o2ring_ble.c`. No changes to the BLE layer.
 
 **Service UUID:** `14839ac4-7d7e-415c-9a42-167340cf2339`
 
@@ -270,7 +270,7 @@ CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 
 ### Port o2ring_ble.c
 
-Copy from cpapdash-push-c3 `miner/main/o2ring_ble.c` and `o2ring_ble.h` with minimal changes:
+Copy from the upstream C3 project `miner/main/o2ring_ble.c` and `o2ring_ble.h` with minimal changes:
 - Remove any SPI-specific code (there is none — the BLE layer is self-contained)
 - Keep all Viatom protocol handling, CRC-8, GATT callbacks, file download logic
 - The streaming download (`o2ring_ble_download_file_stream`) is useful for UART chunking
@@ -305,8 +305,8 @@ The mule should use a longer UART timeout for O2Ring requests: 30s for status/fi
 ## Files to Modify
 
 **Miner (new):**
-- `main/o2ring_ble.c` — port from cpapdash-push-c3
-- `main/o2ring_ble.h` — port from cpapdash-push-c3
+- `main/o2ring_ble.c` — port from the upstream C3 project
+- `main/o2ring_ble.h` — port from the upstream C3 project
 
 **Miner (modify):**
 - `main/CMakeLists.txt` — add `bt` to REQUIRES, add `o2ring_ble.c` to SRCS
