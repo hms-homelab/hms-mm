@@ -53,6 +53,7 @@ typedef struct {
     uint32_t range_end;
     bool meta_sent;
     bool error;
+    bool aborted;   /* mule sent proxy_abort — client gone, stop streaming */
 } proxy_ctx_t;
 
 void scanner_task_load_ezshare_creds(void)
@@ -133,6 +134,15 @@ static esp_err_t proxy_chunk_callback(const uint8_t *data, size_t len,
                                        size_t seq, bool is_last, void *ctx)
 {
     proxy_ctx_t *pctx = (proxy_ctx_t *)ctx;
+
+    /* Stop early if the mule aborted this stream (HTTP client disconnected).
+     * Returning an error unwinds ezshare_raw_get_range so we don't keep pulling
+     * the whole file off the card and flooding UART with chunks nobody reads. */
+    if (uart_check_proxy_abort()) {
+        ESP_LOGW(TAG, "proxy_abort received for req_id=%d — stopping stream", pctx->req_id);
+        pctx->aborted = true;
+        return ESP_FAIL;
+    }
 
     if (!pctx->meta_sent) {
         uint32_t total_size;
@@ -409,7 +419,12 @@ static void scanner_task_loop(void *pvParameters)
                     &pctx.http_status, &pctx.content_length,
                     proxy_chunk_callback, &pctx);
 
-                if (err != ESP_OK || pctx.error) {
+                if (pctx.aborted) {
+                    /* Client gone — mule already abandoned the response. Stay
+                     * silent and let the channel go idle (mule drains any
+                     * already-queued chunks). */
+                    ESP_LOGW(TAG, "proxy req_id=%d aborted by mule", proxy_req_id);
+                } else if (err != ESP_OK || pctx.error) {
                     ESP_LOGE(TAG, "proxy failed: %s", esp_err_to_name(err));
                     if (!pctx.meta_sent)
                         send_error_json(proxy_req_id, "ezShare request failed", "HTTP_FAILED");

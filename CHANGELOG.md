@@ -7,13 +7,14 @@ Version format: `YYYY.MINOR.PATCH`
 ### Fixed
 - **HTTP server wedged under concurrent clients / a slow card.** `esp_http_server` runs a single task, so a blocking handler (`/dir`, `/download`, or an `o2ring` request waiting up to ~2 min on BLE) stalled every other request, including the static `/api/status`. Adopted the ESP-IDF async-handler pattern: the UART-backed handlers now run on a worker pool (`http_async`), freeing the httpd task so the server stays responsive. With one UART link and one miner scanner, the pool is sized to 1 worker (proxy work is serialized to what the miner can actually handle); excess concurrent requests get an immediate "Server busy" 503 instead of piling up.
 - **Proxy could hold its mutex forever.** `proxy_forward_request`'s per-frame UART timeout reset on every successful read, so a flood of stale-`req_id` frames (e.g. after a client disconnect) could spin the loop indefinitely while holding `s_proxy_mutex`. Added a no-progress stall-deadline that resets only on a frame for the active request, so the mutex is always released.
+- **Client-disconnect abort.** When the HTTP client drops mid-stream, the mule now sends a `proxy_abort` and drains the miner's leftover chunks (capped by `PROXY_ABORT_DRAIN_MS`), and the miner stops its ezShare fetch immediately: it peeks the UART RX buffer between chunks (`uart_check_proxy_abort`) and bails out of `ezshare_raw_get_range`. Stops a dead request from pulling the whole file off the card and colliding with the next request's response.
 - **`PROXY_REQ_TIMEOUT_MS` 60s to 30s.** Per-frame margin for a slow/flaky ezShare card, without the old wedge risk now that the async pool keeps the server responsive.
 
 ### Added
 - **`miner/ble_active` NVS flag (default off).** Bringing up the O2Ring BLE disconnects the ezShare WiFi link (shared radio on the C3), which interrupts CPAP data collection. The miner now refuses `o2ring` requests with "BLE disabled" unless `ble_active=1` is set in NVS, so the data link is never dropped unexpectedly. Set the flag (then reboot) to enable BLE for development.
 
 ### Notes
-- Built clean and code-reviewed, but **not yet hardware-tested** (no UART rig available at release time); hardware validation to follow. A miner-side proxy stream-abort on client disconnect is a planned follow-up.
+- Built clean and code-reviewed, but **not yet hardware-tested** (no UART rig available at release time); hardware validation to follow.
 
 ## [2026.0.4] - 2026-05-31
 

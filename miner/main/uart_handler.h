@@ -33,6 +33,13 @@ esp_err_t uart_send_json(const char *json_str);
 int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms);
 
 /**
+ * @brief Non-blocking peek for a buffered "proxy_abort" control message.
+ *        Used by the proxy download callback to stop streaming when the mule
+ *        signals the HTTP client disconnected. Returns true if seen.
+ */
+bool uart_check_proxy_abort(void);
+
+/**
  * @brief Parse received JSON and extract field
  * @param json_str JSON string to parse
  * @param field Field name to extract

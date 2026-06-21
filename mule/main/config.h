@@ -35,6 +35,8 @@
                                             // slow/flaky ezShare card does not 504 mid-
                                             // download; safe to be long now that the async
                                             // worker pool keeps the httpd task responsive.
+#define PROXY_ABORT_DRAIN_MS        2000    // cap on draining the miner's leftover chunks
+                                            // after a mid-stream client disconnect
 
 // O2Ring UART timeouts (BLE operations are slower than ezShare HTTP)
 #define O2RING_STATUS_TIMEOUT_MS    20000

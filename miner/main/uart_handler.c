@@ -119,6 +119,24 @@ esp_err_t uart_send_json(const char *json_str) {
  * @param timeout_ms Timeout in milliseconds
  * @return Number of bytes received (excluding newline), or -1 on error/timeout
  */
+bool uart_check_proxy_abort(void) {
+    /* Non-blocking peek for a mid-stream "proxy_abort" from the mule (HTTP client
+     * gone). The UART driver's RX ring buffer fills in the background, so an abort
+     * sent while we're streaming is waiting here. During a stream the scanner is
+     * the only UART reader and the mule sends nothing else, so a substring match
+     * is enough; consuming the bytes is fine (they are the abort). */
+    if (!uart_initialized) return false;
+    size_t avail = 0;
+    if (uart_get_buffered_data_len(UART_PORT_NUM, &avail) != ESP_OK || avail == 0)
+        return false;
+    static char buf[256];
+    size_t to_read = avail < sizeof(buf) - 1 ? avail : sizeof(buf) - 1;
+    int n = uart_read_bytes(UART_PORT_NUM, (uint8_t *)buf, to_read, 0);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return strstr(buf, "proxy_abort") != NULL;
+}
+
 int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
     if (!uart_initialized) {
         ESP_LOGE(TAG, "UART not initialized");

@@ -79,6 +79,31 @@ static esp_err_t send_proxy_req(int req_id, const char *path,
     return err;
 }
 
+/* Tell the miner to stop streaming this req_id (HTTP client gone), then drain its
+ * leftover chunks so the next request starts on a clean UART. Called while still
+ * holding s_proxy_mutex. The miner stops within a chunk or two of the abort; we
+ * read and discard whatever was already queued until the link goes idle. */
+static void proxy_send_abort_and_drain(int req_id)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "proxy_abort");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+
+    static char drain_buf[PROXY_UART_BUF_SIZE];
+    int drained = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)PROXY_ABORT_DRAIN_MS * 1000;
+    while (esp_timer_get_time() < deadline) {
+        /* short per-frame wait: a queued chunk reads fast; once the miner has
+         * stopped and the link is idle, this times out and we're done. */
+        if (uart_receive_json(drain_buf, sizeof(drain_buf), 200) <= 0) break;
+        drained++;
+    }
+    ESP_LOGI(TAG, "proxy abort req_id=%d: drained %d stale frame(s)", req_id, drained);
+}
+
 /* ── Core proxy: forward request via UART, stream response ─────── */
 
 static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
@@ -278,6 +303,13 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     }
 
 cleanup:
+    /* If a stream was in progress but didn't finish cleanly (client disconnect,
+     * timeout, or error — ret is only ESP_OK on the is_last success path), the
+     * miner may still be pushing chunks for this req_id. Tell it to stop and drain
+     * the backlog so the next request starts on a clean UART. */
+    if (chunked_started && ret != ESP_OK) {
+        proxy_send_abort_and_drain(req_id);
+    }
     xSemaphoreGive(s_proxy_mutex);
     return ret;
 }
