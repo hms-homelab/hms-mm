@@ -9,6 +9,7 @@
 #include "file_server.h"
 #include "uart_handler.h"
 #include "wifi_manager.h"
+#include "http_async.h"
 #include "config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -112,8 +113,25 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     static uint8_t decode_buf[PROXY_CHUNK_SIZE];
     int parse_failures = 0;
     int expected_seq = 0;
+    /* No-progress stall window. The per-frame timeout resets on every successful
+     * uart_receive_json (even stale-req_id frames), so it can't catch a miner
+     * flooding stale frames after a client disconnect — the loop would spin
+     * forever holding s_proxy_mutex. This bounds total time WITHOUT a frame for
+     * OUR req_id; it's reset only on a matching frame below. */
+    int64_t stall_deadline = esp_timer_get_time() + (int64_t)PROXY_REQ_TIMEOUT_MS * 1000;
 
     while (true) {
+        if (esp_timer_get_time() > stall_deadline) {
+            ESP_LOGE(TAG, "proxy stalled (no progress) for req_id=%d — releasing", req_id);
+            if (!chunked_started) {
+                httpd_resp_set_status(req, "504 Gateway Timeout");
+                httpd_resp_send(req, "Miner stalled", HTTPD_RESP_USE_STRLEN);
+            } else {
+                httpd_resp_send_chunk(req, NULL, 0);
+            }
+            ret = ESP_ERR_TIMEOUT;
+            goto cleanup;
+        }
         int len = uart_receive_json(uart_buf, sizeof(uart_buf), PROXY_REQ_TIMEOUT_MS);
         if (len <= 0) {
             ESP_LOGE(TAG, "UART timeout for req_id=%d", req_id);
@@ -149,6 +167,8 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
 
         cJSON *id_j = cJSON_GetObjectItem(msg, "id");
         if (id_j && id_j->valueint != req_id) { cJSON_Delete(msg); continue; }
+        if (id_j && id_j->valueint == req_id)   /* progress for our request: extend the stall window */
+            stall_deadline = esp_timer_get_time() + (int64_t)PROXY_REQ_TIMEOUT_MS * 1000;
 
         if (strcmp(type->valuestring, "error") == 0) {
             cJSON *em = cJSON_GetObjectItem(msg, "message");
@@ -331,6 +351,13 @@ static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
 
 static esp_err_t handle_o2ring_status(httpd_req_t *req)
 {
+    if (!http_async_on_worker()) {
+        if (http_async_dispatch(req, handle_o2ring_status) == ESP_OK) return ESP_OK;
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
     if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
@@ -359,6 +386,13 @@ static esp_err_t handle_o2ring_status(httpd_req_t *req)
 
 static esp_err_t handle_o2ring_files(httpd_req_t *req)
 {
+    if (!http_async_on_worker()) {
+        if (http_async_dispatch(req, handle_o2ring_files) == ESP_OK) return ESP_OK;
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
     char query[512] = {0};
     char name_param[64] = {0};
     bool has_name = false;
@@ -488,6 +522,13 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
 
 static esp_err_t handle_o2ring_live(httpd_req_t *req)
 {
+    if (!http_async_on_worker()) {
+        if (http_async_dispatch(req, handle_o2ring_live) == ESP_OK) return ESP_OK;
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
     if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
@@ -518,6 +559,13 @@ static esp_err_t handle_o2ring_live(httpd_req_t *req)
 
 static esp_err_t handle_dir(httpd_req_t *req)
 {
+    if (!http_async_on_worker()) {
+        if (http_async_dispatch(req, handle_dir) == ESP_OK) return ESP_OK;
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
     char query[MAX_PATH * 2] = {0};
     char dir_param[MAX_PATH] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
@@ -536,6 +584,13 @@ static esp_err_t handle_dir(httpd_req_t *req)
 
 static esp_err_t handle_download(httpd_req_t *req)
 {
+    if (!http_async_on_worker()) {
+        if (http_async_dispatch(req, handle_download) == ESP_OK) return ESP_OK;
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
     char query[MAX_PATH * 2] = {0};
     char file_param[MAX_PATH] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||

@@ -70,3 +70,13 @@ void nvs_config_set_ezshare(const char *ssid, const char *pass)
     write_str("ez_pass", pass);
     ESP_LOGI(TAG, "ezShare credentials stored (SSID: %s)", ssid);
 }
+
+bool nvs_config_ble_active(void)
+{
+    /* Default OFF: bringing up BLE for the O2Ring disconnects the ezShare WiFi
+     * link (shared radio on the C3), which interrupts CPAP data collection. Ship
+     * disabled; set NVS miner/ble_active=1 (then reboot) to enable for dev. */
+    if (!s_nvs) return false;
+    uint8_t v = 0;
+    return (nvs_get_u8(s_nvs, "ble_active", &v) == ESP_OK) && (v != 0);
+}

@@ -216,6 +216,15 @@ static void send_o2ring_live(int req_id)
 
 static bool ensure_ble_ready(int req_id)
 {
+    /* BLE gate: off by default. Bringing up BLE drops the ezShare WiFi link
+     * (shared radio on the C3), interrupting CPAP collection — so don't touch the
+     * radio at all unless explicitly enabled via NVS miner/ble_active=1. */
+    if (!nvs_config_ble_active()) {
+        ESP_LOGW(TAG, "O2Ring request but ble_active=0 — BLE disabled");
+        send_error_json(req_id, "O2Ring BLE disabled", "BLE_DISABLED");
+        return false;
+    }
+
     /* Disconnect WiFi if connected (radio shared on ESP32-C3) */
     if (wifi_manager_is_connected()) {
         ESP_LOGI(TAG, "Disconnecting WiFi for BLE");
