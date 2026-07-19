@@ -5,7 +5,7 @@
 
 // Firmware identity
 #define FW_PROJECT          "hms-mm"
-#define FW_VERSION          "2026.0.3"
+#define FW_VERSION          "2026.0.6"
 
 // =============================================================================
 // Miner config — ezShare creds from NVS first, Kconfig fallback
@@ -24,11 +24,13 @@
 #define HTTP_TIMEOUT_MS             30000
 #define HTTP_BUFFER_SIZE            4096
 
-// UART (miner TX=21, RX=20 — crossed with mule TX=20, RX=21)
+// UART: TX=GPIO2, RX=GPIO3. Both boards use identical pins; the 3D-printed
+// tape board does the TX->RX crossover via the 180-deg module layout.
+// GPIO2 is a strapping pin but is always TX (idles high), so it stays boot-safe.
 #define UART_PORT_NUM               UART_NUM_1
 #define UART_BAUD_RATE              115200
-#define UART_TX_PIN                 GPIO_NUM_21
-#define UART_RX_PIN                 GPIO_NUM_20
+#define UART_TX_PIN                 GPIO_NUM_2
+#define UART_RX_PIN                 GPIO_NUM_3
 #define UART_RX_BUFFER_SIZE         8192
 #define UART_TX_BUFFER_SIZE         8192
 #define UART_QUEUE_SIZE             20

@@ -9,3 +9,6 @@ managed_components/
 *~
 .DS_Store
 Thumbs.db
+
+# ESP-IDF / clangd build cache
+**/.cache/

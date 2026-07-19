@@ -15,7 +15,7 @@ WiFi SD Card AP          JSON + newline          Home Network
 (192.168.4.1)            TX/RX crossed           (your router)
     |                                                 |
     v  WiFi                                     WiFi  v
-+------------------+    GPIO 20/21    +------------------+
++------------------+   GPIO 2/3 UART  +------------------+
 |  Miner (ESP32-C3)|  <------------>  |  Mule (ESP32-C3) |
 |                  |                  |                  |
 |  Connects to SD  |  proxy_req -->   |  HTTP server :80 |
@@ -52,13 +52,21 @@ Requires [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/stable/es
 
 ### 2. Wire UART
 
-Connect miner and mule with 2 signal wires + ground (TX/RX crossed):
+Connect miner and mule with 2 signal wires + ground. Both boards use the same
+pins (TX = GPIO2, RX = GPIO3); cross them so each board's TX reaches the other's RX:
 
 | Miner | Mule | Signal |
 |-------|------|--------|
-| GPIO 21 (TX) | GPIO 21 (RX) | Miner TX -> Mule RX |
-| GPIO 20 (RX) | GPIO 20 (TX) | Mule TX -> Miner RX |
+| GPIO 3 (RX) | GPIO 2 (TX) | Mule TX -> Miner RX |
+| GPIO 2 (TX) | GPIO 3 (RX) | Miner TX -> Mule RX |
 | GND | GND | Common ground |
+| 3V3 | 3V3 | Shared power rail (power either board) |
+
+Tie the two 3V3 pins together and you can power the whole bridge from a single
+USB-C on either board. GPIO2 is a strapping pin, but it is always the TX line
+(which idles high), so it stays boot-safe. Prefer the
+[3D-printed board](hardware/3d-pcb/) below, which does the TX/RX crossover and the
+3V3/GND rails for you in copper.
 
 ### 3. Build and Flash
 
@@ -280,6 +288,21 @@ hms-mm/
       config.h              # Pin assignments, timeouts, defaults
     partitions.csv
 ```
+
+## 3D-Printed Board
+
+There is a 3D-printed "tape PCB" for this project in [`hardware/3d-pcb/`](hardware/3d-pcb/):
+a single-layer printed substrate where copper foil tape laid into grooves becomes the
+traces, no fab and no soldering the modules down. Two ESP32-C3 SuperMini pockets, the two
+UART signals routed as parallel non-crossing diagonals across the gap, and a ground loop
+around the edge. Each board powers off its own USB-C.
+
+- `hms-mm-uart-tape-board.scad` (OpenSCAD source, edit the params up top)
+- `hms-mm-uart-tape-board.stl` (ready to print)
+
+Print it in something tougher than PLA if you want to sand the copper back flush. The full
+story of the technique, and how this whole thing started as an ugly copper-tape prototype,
+is written up here: [My very first ugly working prototype (with a 3D printed PCB)](https://www.cpapdash.com/blog/ugly-prototype-3d-printed-pcb).
 
 ## License
 
