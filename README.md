@@ -293,12 +293,14 @@ hms-mm/
 
 There is a 3D-printed "tape PCB" for this project in [`hardware/3d-pcb/`](hardware/3d-pcb/):
 a single-layer printed substrate where copper foil tape laid into grooves becomes the
-traces, no fab and no soldering the modules down. Two ESP32-C3 SuperMini pockets, the two
-UART signals routed as parallel non-crossing diagonals across the gap, and a ground loop
-around the edge. Each board powers off its own USB-C.
+traces, no fab. Two ESP32-C3 SuperMini pockets sized from the real footprint, the two UART
+signals routed as parallel non-crossing diagonals across the gap, GND and a shared 3V3 rail
+looped back through the interior, and both SuperMinis flush to the edges so each USB-C
+overhangs and a cable plugs straight in. Power the whole bridge from either USB-C.
 
-- `hms-mm-uart-tape-board.scad` (OpenSCAD source, edit the params up top)
-- `hms-mm-uart-tape-board.stl` (ready to print)
+- `hms-mm-uart-tape-board.scad` (OpenSCAD source; set `part` to "board", "lid", or "both")
+- `hms-mm-uart-tape-board.stl` (the substrate, ready to print)
+- `hms-mm-uart-tape-lid.stl` (snap-on lid with a USB-C window per port)
 
 Print it in something tougher than PLA if you want to sand the copper back flush. The full
 story of the technique, and how this whole thing started as an ugly copper-tape prototype,
