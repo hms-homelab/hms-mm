@@ -32,6 +32,20 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Fixed
 
+- **OTA rollback protection was never actually switched on**, on either board,
+  despite `sdkconfig.defaults` asking for it and the firmware reporting it as
+  enabled. ESP-IDF only reads `sdkconfig.defaults` when `sdkconfig` does not
+  already exist, so every default added to an existing checkout was silently
+  ignored. Proven on hardware: a deliberately deaf miner image (RX on an
+  unconnected pin) ran indefinitely instead of reverting. With the config
+  regenerated, the same image is reverted after 180 s and the working firmware
+  comes back on its own. Two other settings were inert the same way:
+  `ESP_HTTP_CLIENT_ENABLE_HTTPS` (so `https://` OTA URLs would have failed) and
+  `HTTPD_MAX_REQ_HDR_LEN` (still 512, so the phone-browser 431 fix did nothing).
+- **The miner never used its stored ezShare credentials.** Same 4-byte NVS
+  probe bug as the mule: any SSID of four characters or more read as absent, so
+  it always fell back to the compiled-in defaults. Invisible with a stock
+  "ez Share" card and total failure with a renamed one.
 - **The link corrupted bulk transfers, and now it does not.** The miner streamed
   chunks at wire speed while the mule was still decoding the previous one and
   pushing it out over WiFi; with no hardware handshake on a two-wire link, the

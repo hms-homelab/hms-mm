@@ -68,6 +68,16 @@ USB-C on either board. GPIO2 is a strapping pin, but it is always the TX line
 [3D-printed board](hardware/3d-pcb/) below, which does the TX/RX crossover and the
 3V3/GND rails for you in copper.
 
+> **If you have built this before, delete `sdkconfig` first.** ESP-IDF only reads
+> `sdkconfig.defaults` when `sdkconfig` does not already exist, so an existing
+> build directory silently ignores new defaults. That is not cosmetic here: it
+> is how OTA rollback protection came to be switched off on a board whose
+> firmware reported it as enabled. Verify after building:
+>
+> ```bash
+> grep CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE mule/sdkconfig miner/sdkconfig
+> ```
+
 ### 3. Build and Flash
 
 ```bash

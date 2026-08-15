@@ -19,6 +19,22 @@ static bool read_str(const char *key, char *buf, size_t buf_size)
     return true;
 }
 
+/* Does this key hold a non-empty string?
+ *
+ * Asks NVS for the required length rather than reading into a probe buffer.
+ * The previous form passed a 4-byte stack buffer, and nvs_get_str returns
+ * ESP_ERR_NVS_INVALID_LENGTH — not ESP_OK — when the buffer is too small, so
+ * ANY stored SSID of four characters or more read as absent. The miner
+ * therefore always fell back to the compiled-in defaults and never used the
+ * credentials the mule had sent it. Invisible with a stock "ez Share" card,
+ * and total failure with a renamed one. Same bug as the mule had. */
+static bool has_str(const char *key)
+{
+    if (!s_nvs) return false;
+    size_t len = 0;
+    return nvs_get_str(s_nvs, key, NULL, &len) == ESP_OK && len > 1;
+}
+
 static void write_str(const char *key, const char *val)
 {
     if (!s_nvs) return;
@@ -50,8 +66,7 @@ void nvs_config_init(void)
 
 bool nvs_config_has_ezshare(void)
 {
-    char tmp[4];
-    return read_str("ez_ssid", tmp, sizeof(tmp));
+    return has_str("ez_ssid");
 }
 
 bool nvs_config_get_ezshare_ssid(char *buf, size_t buf_size)
