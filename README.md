@@ -7,6 +7,17 @@ Dual ESP32-C3 proxy bridge for WiFi SD cards and Wellue O2Ring oximeters. The mu
 
 Solves the "two WiFi networks" problem: WiFi SD cards create their own AP, so a single-radio device can't be on both the SD card's network and your home network simultaneously. Two ESP32-C3s, connected by UART, each handle one network. The miner also supports BLE connections to a Wellue O2Ring for oximetry data (SpO2, heart rate, stored session files).
 
+## What to use it with
+
+[hms-cpap](https://github.com/hms-homelab/hms-cpap) is the companion this was
+built for. An ezShare card is invisible to your network because it is its own
+access point; hms-mm puts it on your LAN over HTTP, and hms-cpap polls that
+address to collect and parse the CPAP data. Set its `CPAP_SOURCE=ezshare` and
+point `EZSHARE_BASE_URL` at the mule.
+
+Anything that can speak HTTP works too — the mule answers `/dir` and
+`/download` the way the card itself would.
+
 ## The device page
 
 Point a browser at the mule for status, the SD card, firmware updates, recent
@@ -224,7 +235,7 @@ Accept-Ranges: bytes
 
 ### O2Ring Oximetry (BLE)
 
-The miner connects to a [Wellue O2Ring](https://www.wellue.com/o2ring) via BLE. The ring must be in standby mode (off-wrist) for file operations. Live readings require the ring to be on-finger and recording.
+The miner connects to a Wellue O2Ring via BLE. The ring must be in standby mode (off-wrist) for file operations. Live readings require the ring to be on-finger and recording.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
