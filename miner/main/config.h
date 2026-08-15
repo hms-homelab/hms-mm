@@ -18,6 +18,12 @@
 #define EZSHARE_WIFI_PASSWORD_DEFAULT "88888888"
 #define WIFI_MAXIMUM_RETRY          5
 #define WIFI_CONNECT_TIMEOUT_MS     10000
+// Reconnect ladder, used only AFTER a first successful association. The
+// ezShare card is a single-client soft AP and its session table wedges if a
+// client reconnects without pause, so a drop must back off rather than knock
+// harder. 1s doubling to 5 minutes.
+#define WIFI_BACKOFF_MIN_MS         1000
+#define WIFI_BACKOFF_MAX_MS         300000
 
 // ezShare HTTP
 #define EZSHARE_IP                  "192.168.4.1"
@@ -57,6 +63,12 @@
 #define MAX_FILENAME_LEN            256
 #define MAX_DATE_FOLDERS            10
 #define JSON_BUFFER_SIZE            4096
+
+// Crash-loop self-heal. Six consecutive crash-boots is well past "unlucky" and
+// into "this will not fix itself"; a device that has stayed up for a minute
+// has cleared every boot-time fault worth counting.
+#define CRASH_LOOP_THRESHOLD        6
+#define CRASH_GUARD_HEALTHY_SEC     60
 
 // OTA rollback watchdog: how long a freshly written, still-unconfirmed image
 // has to decode a frame from the mule before it reboots and lets the

@@ -14,6 +14,20 @@
 #define HOME_WIFI_PASSWORD_DEFAULT  "your_wifi_password"
 #define WIFI_MAXIMUM_RETRY          5
 #define WIFI_CONNECT_TIMEOUT_MS     15000
+// Reconnect ladder, used only AFTER a first successful join. A drop then means
+// the network exists and the credentials work, so retry forever on a backoff
+// rather than giving up: a router reboot must not take the device offline
+// until someone power-cycles it. 1s doubling to 5 minutes.
+#define WIFI_BACKOFF_MIN_MS         1000
+#define WIFI_BACKOFF_MAX_MS         300000
+// mDNS name. Registered once per boot, alongside a per-unit service instance
+// so several units on one network stay individually discoverable.
+#define MDNS_HOSTNAME               "cpapdash"
+// Consecutive boots that fail to join the stored network before concluding the
+// credentials are wrong and falling back to the setup portal. High on purpose:
+// a router that is slow to come back after a power cut must not cost the user
+// a re-provision, and each attempt is only a few seconds plus a reboot.
+#define WIFI_FAIL_THRESHOLD         15
 
 // UART: TX=GPIO2, RX=GPIO3. Both boards use identical pins; the 3D-printed
 // tape board does the TX->RX crossover via the 180-deg module layout.
@@ -60,6 +74,12 @@
 #define O2RING_FILES_TIMEOUT_MS     25000
 #define O2RING_LIVE_TIMEOUT_MS      25000
 #define O2RING_DOWNLOAD_TIMEOUT_MS  120000
+
+// Crash-loop self-heal. Six consecutive crash-boots is well past "unlucky" and
+// into "this will not fix itself"; a device that has stayed up for a minute
+// has cleared every boot-time fault worth counting.
+#define CRASH_LOOP_THRESHOLD        6
+#define CRASH_GUARD_HEALTHY_SEC     60
 
 // Local HTTP server (control page + proxy routes share one httpd)
 #define CONTROL_HTTP_PORT           80

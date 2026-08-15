@@ -4,6 +4,7 @@ idf_component_register(
         "wifi_manager.c"
         "uart_handler.c"
         "nvs_config.c"
+        "crash_guard.c"
         "captive_portal.c"
         "file_server.c"
         "control_server.c"

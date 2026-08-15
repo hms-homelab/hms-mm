@@ -69,6 +69,33 @@ can be updated without the other, so in the field they legitimately differ.
   only while `scanner_task` was the sole transmitter. Added ahead of the task
   split, so two interleaved writes can never produce one unparseable line plus
   one lost frame.
+- **The miner hammered the ezShare card instead of backing off.** Every
+  disconnect fired up to `WIFI_MAXIMUM_RETRY` immediate `esp_wifi_connect()`
+  calls, forever, with no delay between them. The card is a single-client soft
+  AP: knocked on like that its session table wedges and it stops answering
+  entirely, which then looks like a dead card rather than a client that will
+  not stop knocking. Now the first join still retries promptly (nothing is
+  established yet), but once a connection has succeeded every later drop goes
+  onto an exponential ladder from 1 s to 5 min, calling `esp_wifi_disconnect()`
+  first to clear stale association state. The mule got the same treatment.
+- **A router reboot took the mule offline until someone power-cycled it.**
+  After exhausting its retries the mule parked in `WIFI_STATUS_ERROR` with
+  nothing left to bring it back. A drop after a successful join now retries on
+  the backoff ladder indefinitely, because at that point the network is known
+  to exist and the credentials are known to work.
+- **`cpapdash.local` stopped resolving after the first reconnect.** mDNS was
+  re-initialised and the hostname re-set on *every* `IP_EVENT_STA_GOT_IP`,
+  which logs "service already exists" and leaves the name unresolvable. It is
+  now registered once per boot, alongside a per-unit `_hms-mm._tcp` service
+  instance keyed by serial, so several units on one network stay individually
+  discoverable even though only one can hold the hostname.
+- **A failed WiFi join at boot dropped a working unit into setup mode.** The
+  most common cause is a router that is not back yet, so this demanded a
+  re-provision for a problem that fixes itself. Boot-time failures are now
+  counted in NVS: below `WIFI_FAIL_THRESHOLD` (15) the device keeps its
+  credentials and reboots to retry, and only past that does it conclude the
+  credentials are wrong and fall back to the portal. Any successful join
+  clears the count.
 - **A provisioned mule could never rejoin its network.** `nvs_config_has_wifi()`
   probed the stored SSID with a 4-byte buffer, and `nvs_get_str` returns
   `ESP_ERR_NVS_INVALID_LENGTH` rather than `ESP_OK` when the buffer is too
@@ -109,6 +136,21 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Added
 
+- **Crash-loop self-heal on both boards** (`crash_guard.c`). A device wedged in
+  a panic loop behind a CPAP machine is unreachable, and the setting most
+  likely to be at fault is exactly what keeps it from coming back. Consecutive
+  crash-boots are counted in RTC memory, which survives a panic but not a power
+  cycle, so unplugging the device is still the user's own clean reset. At six
+  in a row the mule clears its WiFi and returns to setup; the miner forgets its
+  card credentials, which the mule re-pushes on its next boot, so healing there
+  costs one round trip rather than a re-provision. Only genuine faults count:
+  our own restarts report `ESP_RST_SW` and can never inflate the streak. A boot
+  that stays up 60 seconds, or reaches "serving", clears it.
+- **The miner logs why WiFi dropped**, with repeat suppression. It captured the
+  reason code and printed none of it, so every cause looked identical in a log;
+  and a flapping link emits enough identical lines to push everything else out
+  of the 8 KB ring before anyone reads it. One line per distinct cause, then a
+  `[+N more with reason=X]` count.
 - **Firmware updates, over the network or by upload.** `POST /api/ota` takes
   `{"target","url"}` and the device fetches and installs it itself;
   `POST /api/update/{mule,miner}` takes the raw `.bin` in the body and needs no

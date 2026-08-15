@@ -122,6 +122,27 @@ void nvs_config_erase_all(void)
     ESP_LOGW(TAG, "mule NVS erased");
 }
 
+uint32_t nvs_config_wifi_fail_bump(void)
+{
+    if (!s_nvs) return 0;
+    uint32_t n = 0;
+    nvs_get_u32(s_nvs, "wifi_fails", &n);
+    n++;
+    nvs_set_u32(s_nvs, "wifi_fails", n);
+    nvs_commit(s_nvs);
+    return n;
+}
+
+void nvs_config_wifi_fail_clear(void)
+{
+    if (!s_nvs) return;
+    uint32_t n = 0;
+    if (nvs_get_u32(s_nvs, "wifi_fails", &n) == ESP_OK && n != 0) {
+        nvs_set_u32(s_nvs, "wifi_fails", 0);
+        nvs_commit(s_nvs);
+    }
+}
+
 uint32_t nvs_config_increment_boot_count(void)
 {
     if (!s_nvs) return 0;

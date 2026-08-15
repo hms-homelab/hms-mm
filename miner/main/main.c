@@ -14,6 +14,7 @@
 #include "nvs_config.h"
 #include "config.h"
 #include "ota_handler.h"
+#include "crash_guard.h"
 
 static const char *TAG = "MAIN";
 
@@ -22,6 +23,7 @@ void app_main(void)
     ESP_LOGI(TAG, "=== %s miner v%s (proxy mode) ===", FW_PROJECT, FW_VERSION);
 
     nvs_config_init();
+    crash_guard_init();
     uart_handler_init();
     wifi_manager_init();
     ezshare_client_init();
@@ -35,6 +37,10 @@ void app_main(void)
     scanner_task_start();
 
     ESP_LOGI(TAG, "=== miner running — waiting for UART proxy requests ===");
+    /* Reaching the run loop with the scanner started is this board's
+     * equivalent of "serving": nothing further is required of it until the
+     * mule speaks. */
+    crash_guard_mark_healthy();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(30000));

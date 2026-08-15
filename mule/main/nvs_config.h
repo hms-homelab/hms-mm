@@ -24,6 +24,11 @@ void nvs_config_set_ezshare(const char *ssid, const char *pass);
 bool nvs_config_get_serial(char *buf, size_t buf_size);
 void nvs_config_set_serial(const char *serial);
 
+// Consecutive boots where the stored WiFi could not be joined. Cleared on any
+// successful join. Used to decide when credentials are the problem.
+uint32_t nvs_config_wifi_fail_bump(void);
+void nvs_config_wifi_fail_clear(void);
+
 // Forget the home WiFi so the next boot lands on the captive portal. ezShare
 // credentials and the serial are kept.
 void nvs_config_clear_wifi(void);

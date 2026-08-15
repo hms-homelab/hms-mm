@@ -3,10 +3,13 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "nvs_config.h"
 #include "mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = LOG_TAG_WIFI;
 
@@ -17,28 +20,134 @@ static EventGroupHandle_t s_event_group = NULL;
 static wifi_status_t s_status = WIFI_STATUS_DISCONNECTED;
 static int s_retry = 0;
 static bool s_init = false;
+static bool s_started = false;
+
+/* Set once this boot has had an IP. Distinguishes "cannot join the network"
+ * from "was on the network and lost it". */
+static bool s_ever_connected = false;
+static int  s_last_disc_reason = 0;
+
+static uint32_t s_backoff_ms = 0;
+static esp_timer_handle_t s_retry_timer = NULL;
+
+/* mDNS is registered ONCE per boot. Re-registering on every reconnect logs
+ * "Service already exists" and leaves the .local name unresolvable, so a unit
+ * that has reconnected even once becomes unreachable by name. The component
+ * re-announces on an address change by itself. */
+static bool s_mdns_up = false;
+
+static int s_suppressed_reason = 0;
+static int s_suppressed_count  = 0;
+
+static void flush_disconnect_log(void)
+{
+    if (s_suppressed_count > 0)
+        ESP_LOGI(TAG, "  [+%d more with reason=%d]", s_suppressed_count, s_suppressed_reason);
+    s_suppressed_count = 0;
+    s_suppressed_reason = 0;
+}
+
+/* One line per distinct cause, then a count. A flapping link otherwise fills
+ * the whole 8 KB log ring with identical lines. */
+static void log_disconnect(int reason)
+{
+    if (reason == s_suppressed_reason) { s_suppressed_count++; return; }
+    flush_disconnect_log();
+    s_suppressed_reason = reason;
+    ESP_LOGI(TAG, "WiFi disconnected (reason=%d)", reason);
+}
+
+static void retry_timer_cb(void *arg)
+{
+    esp_wifi_disconnect();      /* clear stale association state first */
+    esp_wifi_connect();
+}
+
+static void schedule_reconnect(void)
+{
+    s_backoff_ms = (s_backoff_ms == 0) ? WIFI_BACKOFF_MIN_MS : s_backoff_ms * 2;
+    if (s_backoff_ms > WIFI_BACKOFF_MAX_MS) s_backoff_ms = WIFI_BACKOFF_MAX_MS;
+
+    if (!s_retry_timer) {
+        const esp_timer_create_args_t args = { .callback = retry_timer_cb, .name = "wifi_retry" };
+        if (esp_timer_create(&args, &s_retry_timer) != ESP_OK) { esp_wifi_connect(); return; }
+    }
+    esp_timer_stop(s_retry_timer);
+    esp_timer_start_once(s_retry_timer, (uint64_t)s_backoff_ms * 1000ULL);
+}
+
+static void mdns_start_once(void)
+{
+    if (s_mdns_up) return;
+    if (mdns_init() != ESP_OK) return;
+    mdns_hostname_set(MDNS_HOSTNAME);
+
+    /* Also advertise a per-unit service instance. Two of these on one network
+     * both want the same hostname, and only one can have it; the instance name
+     * is keyed by serial so each stays individually discoverable regardless. */
+    char serial[24] = {0};
+    nvs_config_get_serial(serial, sizeof(serial));
+    char instance[48];
+    snprintf(instance, sizeof(instance), "%s %s", FW_PROJECT, serial[0] ? serial : "unknown");
+
+    mdns_txt_item_t txt[] = {
+        { "serial", serial[0] ? serial : "unknown" },
+        { "fw",     FW_VERSION },
+    };
+    if (mdns_service_add(instance, "_" FW_PROJECT, "_tcp", CONTROL_HTTP_PORT,
+                         txt, sizeof(txt) / sizeof(txt[0])) == ESP_OK)
+        ESP_LOGI(TAG, "mDNS: %s.local and %s over _%s._tcp",
+                 MDNS_HOSTNAME, instance, FW_PROJECT);
+    else
+        ESP_LOGI(TAG, "mDNS hostname: %s.local", MDNS_HOSTNAME);
+
+    s_mdns_up = true;
+}
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         s_status = WIFI_STATUS_CONNECTING;
+
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry < WIFI_MAXIMUM_RETRY) {
-            esp_wifi_connect();
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        if (d) s_last_disc_reason = d->reason;
+        log_disconnect(s_last_disc_reason);
+
+        if (!s_ever_connected && s_retry < WIFI_MAXIMUM_RETRY) {
+            esp_wifi_connect();          /* first join: retry promptly */
             s_retry++;
-        } else {
+            s_status = WIFI_STATUS_CONNECTING;
+            return;
+        }
+        if (!s_ever_connected) {
+            /* Give up on THIS attempt so the caller can fall back to the setup
+             * portal rather than blocking forever on a network that is not
+             * there or whose password changed. */
             xEventGroupSetBits(s_event_group, WIFI_FAIL_BIT);
             s_status = WIFI_STATUS_ERROR;
+            return;
         }
+
+        /* Already had an IP, so the network exists and the credentials work;
+         * something transient took it away (a router reboot, a roam, a power
+         * cut). Keep retrying on a backoff ladder forever. Previously this
+         * path stopped after WIFI_MAXIMUM_RETRY and left the device parked in
+         * ERROR with nothing to bring it back, so a router reboot took the
+         * mule offline until someone power-cycled it. */
+        s_status = WIFI_STATUS_CONNECTING;
+        schedule_reconnect();
+
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Connected, IP: " IPSTR, IP2STR(&e->ip_info.ip));
         s_retry = 0;
+        s_backoff_ms = 0;
+        s_ever_connected = true;
+        flush_disconnect_log();
         s_status = WIFI_STATUS_CONNECTED;
-        mdns_init();
-        mdns_hostname_set("cpapdash");
-        ESP_LOGI(TAG, "mDNS hostname: cpapdash.local");
+        mdns_start_once();
         xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -79,7 +188,18 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
     xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     s_retry = 0;
-    esp_wifi_start();
+    s_backoff_ms = 0;
+    esp_err_t rc = esp_wifi_start();
+    if (rc == ESP_ERR_WIFI_NOT_STOPPED || s_started) {
+        /* Already running. esp_wifi_start() is then a no-op and STA_START
+         * never fires again, so nothing would reconnect and this call would
+         * simply wait out its timeout. Force a fresh association. */
+        ESP_LOGI(TAG, "WiFi already started, forcing reassociation");
+        esp_wifi_disconnect();
+        esp_wifi_connect();
+    } else if (rc == ESP_OK) {
+        s_started = true;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(s_event_group,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,

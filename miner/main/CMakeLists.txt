@@ -6,6 +6,7 @@ idf_component_register(
         "uart_handler.c"
         "scanner_task.c"
         "nvs_config.c"
+        "crash_guard.c"
         "o2ring_ble.c"
         "ota_handler.c"
     INCLUDE_DIRS "."

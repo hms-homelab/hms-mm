@@ -24,6 +24,7 @@
 #include "control_server.h"
 #include "log_ring.h"
 #include "ota_service.h"
+#include "crash_guard.h"
 #include "mule_task.h"
 #include "config.h"
 
@@ -37,6 +38,9 @@ void app_main(void)
     ESP_LOGI(TAG, "=== %s mule v%s (proxy mode) ===", FW_PROJECT, FW_VERSION);
 
     nvs_config_init();
+    /* After NVS (it may need to clear credentials) and before anything that
+     * could itself crash. */
+    crash_guard_init();
     uart_handler_init();
 
     char ssid[33] = {0}, pass[65] = {0};
@@ -49,9 +53,27 @@ void app_main(void)
         wifi_manager_init();
         wifi_ok = (wifi_manager_connect(ssid, pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK);
         if (!wifi_ok) {
+            /* Do NOT jump straight to the setup portal. The overwhelmingly
+             * common reason a known-good device fails to join at boot is that
+             * the router is not back yet, and dropping into setup mode over
+             * that would strand a working unit and demand re-provisioning for
+             * a problem that fixes itself. Retry across reboots, and only
+             * conclude the credentials are wrong once it has failed
+             * persistently. */
+            uint32_t fails = nvs_config_wifi_fail_bump();
+            if (fails < WIFI_FAIL_THRESHOLD) {
+                ESP_LOGW(TAG, "WiFi join failed (%lu/%d) — keeping credentials, retrying",
+                         (unsigned long)fails, WIFI_FAIL_THRESHOLD);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                esp_restart();
+            }
+            ESP_LOGE(TAG, "WiFi join failed %lu times — clearing credentials for setup",
+                     (unsigned long)fails);
+            nvs_config_clear_wifi();
             captive_portal_start();
             return;
         }
+        nvs_config_wifi_fail_clear();
     } else if (strlen(HOME_WIFI_SSID_DEFAULT) > 0 &&
                strcmp(HOME_WIFI_SSID_DEFAULT, "your_wifi_ssid") != 0) {
         ESP_LOGI(TAG, "Using Kconfig WiFi (SSID: %s)", HOME_WIFI_SSID_DEFAULT);
@@ -82,6 +104,8 @@ void app_main(void)
      * prove about itself. Confirm now so the bootloader stops holding the old
      * image in reserve. */
     ota_service_confirm_boot();
+    /* Serving HTTP proves more than uptime does. */
+    crash_guard_mark_healthy();
 
     mule_task_init();
     mule_task_start();

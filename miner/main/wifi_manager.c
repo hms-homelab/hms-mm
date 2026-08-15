@@ -10,6 +10,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "wifi_manager.h"
 #include "config.h"
@@ -33,6 +34,68 @@ static bool wifi_initialized = false;
  * bare 502. */
 static int last_disc_reason = 0;
 
+/* True once this boot has associated at least once. Distinguishes "cannot find
+ * the card" from "was talking to the card and lost it", which need opposite
+ * retry behaviour. */
+static bool ever_connected = false;
+static bool wifi_started = false;
+
+/* Current backoff delay; 0 means the ladder has not started. */
+static uint32_t backoff_ms = 0;
+static esp_timer_handle_t reconnect_timer = NULL;
+
+/* Repeat-suppression for the disconnect log. A flapping link produces one line
+ * per attempt, and at these intervals that is enough to push everything else
+ * out of an 8 KB log ring long before anyone reads it. */
+static int  suppressed_reason = 0;
+static int  suppressed_count  = 0;
+
+static void flush_disconnect_log(void)
+{
+    if (suppressed_count > 0)
+        ESP_LOGI(TAG, "  [+%d more with reason=%d]", suppressed_count, suppressed_reason);
+    suppressed_count = 0;
+    suppressed_reason = 0;
+}
+
+static void log_disconnect(int reason)
+{
+    if (reason == suppressed_reason) {
+        suppressed_count++;              /* same cause; summarise on change */
+        return;
+    }
+    flush_disconnect_log();
+    suppressed_reason = reason;
+    ESP_LOGI(TAG, "WiFi disconnected (reason=%d)", reason);
+}
+
+static void reconnect_timer_cb(void *arg)
+{
+    /* Clear any stale association state before trying again. Without this the
+     * supplicant can sit believing it is mid-association and the connect call
+     * quietly does nothing. */
+    esp_wifi_disconnect();
+    esp_wifi_connect();
+}
+
+static void schedule_reconnect(void)
+{
+    backoff_ms = (backoff_ms == 0) ? WIFI_BACKOFF_MIN_MS : backoff_ms * 2;
+    if (backoff_ms > WIFI_BACKOFF_MAX_MS) backoff_ms = WIFI_BACKOFF_MAX_MS;
+
+    if (!reconnect_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = reconnect_timer_cb, .name = "wifi_retry",
+        };
+        if (esp_timer_create(&args, &reconnect_timer) != ESP_OK) {
+            esp_wifi_connect();          /* no timer: fall back to immediate */
+            return;
+        }
+    }
+    esp_timer_stop(reconnect_timer);
+    esp_timer_start_once(reconnect_timer, (uint64_t)backoff_ms * 1000ULL);
+}
+
 /**
  * @brief WiFi event handler
  */
@@ -47,26 +110,42 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
         if (d) last_disc_reason = d->reason;
 
-        if (retry_count < WIFI_MAXIMUM_RETRY) {
-            /* Always print the reason: it is the single most useful field when
-             * triaging an ezShare failure from a log, and without it every
-             * cause looks identical. */
-            ESP_LOGI(TAG, "WiFi disconnected (reason=%d), retrying... (%d/%d)",
-                     last_disc_reason, retry_count + 1, WIFI_MAXIMUM_RETRY);
+        log_disconnect(last_disc_reason);
+
+        if (!ever_connected && retry_count < WIFI_MAXIMUM_RETRY) {
+            /* Initial connect: retry promptly. Nothing is established yet, so
+             * there is no session on the card to protect. */
             esp_wifi_connect();
             retry_count++;
             wifi_status = WIFI_STATUS_CONNECTING;
-        } else {
-            ESP_LOGE(TAG, "WiFi connection failed after %d retries (reason=%d)",
+            return;
+        }
+
+        if (!ever_connected) {
+            ESP_LOGE(TAG, "WiFi connection failed after %d attempts (reason=%d)",
                      WIFI_MAXIMUM_RETRY, last_disc_reason);
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
             wifi_status = WIFI_STATUS_ERROR;
+            return;
         }
+
+        /* Once we HAVE connected before, every later drop goes straight to
+         * exponential backoff. The old code burst WIFI_MAXIMUM_RETRY immediate
+         * reconnects on every single disconnect, forever, with no delay
+         * between them. The ezShare card is a single-client soft AP: hammered
+         * like that its session table wedges and it stops answering entirely,
+         * which then looks like a dead card rather than a client that will not
+         * stop knocking. */
+        wifi_status = WIFI_STATUS_CONNECTING;
+        schedule_reconnect();
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
         retry_count = 0;
+        backoff_ms  = 0;
+        ever_connected = true;
+        flush_disconnect_log();
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
         wifi_status = WIFI_STATUS_CONNECTED;
     }
@@ -171,9 +250,24 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
 
     // Start WiFi
     retry_count = 0;
+    backoff_ms  = 0;
     ret = esp_wifi_start();
-    if (ret != ESP_OK) {
+    if (ret == ESP_ERR_WIFI_NOT_STOPPED || wifi_started) {
+        /* Already running, usually because the card dropped us rather than
+         * because anyone called disconnect(). esp_wifi_start() is then a no-op,
+         * STA_START never fires again, and nothing would reconnect: the caller
+         * would just wait out its timeout. Force a fresh association. */
+        ESP_LOGI(TAG, "WiFi already started, forcing reassociation");
+        esp_wifi_disconnect();
+        ret = esp_wifi_connect();
+    } else if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start WiFi: %s", esp_err_to_name(ret));
+        return ret;
+    } else {
+        wifi_started = true;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to (re)connect WiFi: %s", esp_err_to_name(ret));
         return ret;
     }
 
