@@ -58,29 +58,18 @@ pushing it out over WiFi, the surplus is simply lost. Chunk CRCs catch that but
 cannot repair it. Acknowledging each chunk paces the miner to what the mule
 actually absorbs.
 
-Measured on real hardware, downloading the same 98 KB file from an ezShare
-card:
+On one bench setup, free-running transfers lost roughly a third of their
+downloads to CRC mismatches, and lowering the baud did not reliably help, while
+the same transfers acknowledged completed essentially every time. Those runs
+are in the commit history rather than here, deliberately: they came from one
+pair of boards joined one particular way, and how you join yours is your
+choice — jumper wires, copper tape, a board you had made. What one setup
+carries cleanly another will not.
 
-| | completed | link errors |
-|---|---|---|
-| free-running, 921600 baud | 0/6 | constant CRC mismatches |
-| free-running, 460800 baud | 7/10 | CRC mismatches |
-| free-running, 230400 baud | 5/10 | CRC mismatches |
-| **acknowledged, 460800 baud** | **19/20, then 10/10** | **none** |
-
-Lowering the baud never helped monotonically, which is what ruled out raw speed
-and pointed at flow control. Acknowledging is also *faster* in practice
-(~12 KB/s), because a corrupted transfer is wasted entirely. The ezShare card,
-not the link, is now the bottleneck — which is where it should be.
-
-**Read the baud numbers with the wiring in mind.** They were measured on a pair
-of C3s joined by a fabricated PCB, using two traces originally laid out for a
-10 MHz SPI bus. The 3D-printed board below is copper foil tape pressed into
-printed grooves, which is a harsher electrical environment, so treat 460800 as
-"what held up on good traces" rather than as a universal answer — dial it down
-if your wiring shows CRC mismatches in `/api/logs`. The acknowledgement itself
-is not hardware-specific: it fixes the mule being starved of the bus while it
-is busy on WiFi, which no amount of clean wiring changes.
+So take the mechanism, not the number. Acknowledging paces the miner to what
+the mule can absorb while it is busy on WiFi, and that holds however the boards
+are wired. `UART_BAUD_RATE` is the one knob, it must match on both boards, and
+if `/api/logs` shows chunk CRC mismatches, lower it.
 
 ## Setup
 

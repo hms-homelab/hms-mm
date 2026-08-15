@@ -42,25 +42,16 @@
 // tape board does the TX->RX crossover via the 180-deg module layout.
 // GPIO2 is a strapping pin but is always TX (idles high), so it stays boot-safe.
 #define UART_PORT_NUM               UART_NUM_1
-// MEASURED ON HARDWARE (2026-08-15), not chosen on theory. NOTE the wiring:
-// this was a pair of C3s on a fabricated PCB, over two traces originally laid
-// out for a 10 MHz SPI bus. The project's own 3D-printed board is copper foil
-// tape in printed grooves, which is harsher, so treat this as an upper bound
-// and dial it down if CRC mismatches show up in /api/logs.
+// There is no hardware flow control: the link is two wires. Reliability comes
+// from acknowledging every chunk (see wait_chunk_ack on the miner), not from
+// this number, and chunk CRCs catch whatever still slips through.
 //
-// There is no hardware flow control: the link is two wires. Chunk CRCs catch
-// corrupted frames, and on the bench a full 98 KB download from an ezShare card
-// completed:
-//     921600  -> 0/6    (constant CRC mismatches)
-//     460800  -> 7/10
-//     230400  -> 5/10
-// Lowering the baud does NOT monotonically improve it, so raw speed is not the
-// variable and dialling further down is chasing the wrong thing. The remaining
-// corruption is almost certainly RX starvation while the mule is busy on WiFi,
-// which a slower wire does not fix. The real fix is per-chunk acknowledgement
-// on the proxy path so the miner never sends faster than the mule consumes —
-// the OTA path already works that way. Until that lands, 460800 is simply the
-// best-measured setting, and the CRC is what stops corruption reaching a file.
+// This value is what one bench pair tolerated. It is a starting point, NOT a
+// specification. How the two boards are joined is entirely up to whoever built
+// the thing — jumper wires, copper tape, a fabricated board, ribbon of unknown
+// length — and what one setup carries cleanly another will not. If /api/logs
+// shows chunk CRC mismatches, lower it. Both boards must match, so changing it
+// means reflashing the pair.
 #define UART_BAUD_RATE              460800
 #define UART_TX_PIN                 GPIO_NUM_2
 #define UART_RX_PIN                 GPIO_NUM_3
