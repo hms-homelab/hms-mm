@@ -21,6 +21,8 @@
 #include "nvs_config.h"
 #include "captive_portal.h"
 #include "file_server.h"
+#include "control_server.h"
+#include "log_ring.h"
 #include "mule_task.h"
 #include "config.h"
 
@@ -28,6 +30,9 @@ static const char *TAG = "MAIN";
 
 void app_main(void)
 {
+    /* Before the first log line, so the ring captures the whole boot. */
+    log_ring_init();
+
     ESP_LOGI(TAG, "=== %s mule v%s (proxy mode) ===", FW_PROJECT, FW_VERSION);
 
     nvs_config_init();
@@ -63,16 +68,11 @@ void app_main(void)
 
     file_server_init();
 
-    httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
-    http_cfg.max_uri_handlers = 8;
-    http_cfg.stack_size = 8192;
-    http_cfg.lru_purge_enable = true;
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &http_cfg) == ESP_OK) {
-        file_server_register(server);
-        ESP_LOGI(TAG, "HTTP proxy server started on port 80");
-    } else {
-        ESP_LOGE(TAG, "Failed to start HTTP server — rebooting");
+    /* control_server owns the httpd and mounts the proxy routes onto it, so
+     * the device page, the status endpoint and the data routes all live on one
+     * server sharing one link lock. */
+    if (control_server_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server, rebooting");
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }

@@ -147,14 +147,27 @@ bool miner_link_reset(void)
 
 /* ── O2Ring gate ──────────────────────────────────────────────────── */
 
+/* Cached so /api/status can report the gate without a wire round-trip on every
+ * page load — opening the status page must never interrupt a transfer. */
+static bool s_o2_enabled;
+
 static bool read_enabled(cJSON *reply, bool *enabled)
 {
     if (!reply) return false;
     bool ok = false;
     cJSON *en = cJSON_GetObjectItem(reply, "enabled");
-    if (cJSON_IsBool(en)) { *enabled = cJSON_IsTrue(en); ok = true; }
+    if (cJSON_IsBool(en)) {
+        *enabled = cJSON_IsTrue(en);
+        s_o2_enabled = *enabled;
+        ok = true;
+    }
     cJSON_Delete(reply);
     return ok;
+}
+
+bool miner_link_cached_o2_enabled(void)
+{
+    return s_o2_enabled;
 }
 
 bool miner_link_get_o2_enabled(bool *enabled)

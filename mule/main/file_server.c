@@ -698,76 +698,16 @@ static esp_err_t handle_download(httpd_req_t *req)
                                   range_start, range_end);
 }
 
-static esp_err_t handle_status(httpd_req_t *req)
-{
-    int64_t up = esp_timer_get_time() / 1000000LL;
-    int secs = (int)(up % 60), mins = (int)((up / 60) % 60), hrs = (int)(up / 3600);
-
-    /* Was a fixed 256-byte string reporting "mqtt":false (there is no MQTT
-     * client anywhere in this project) and "o2ring":false regardless of the
-     * actual state. Phase 4 replaces this wholesale with the control server's
-     * version; for now it at least reports things that are true. */
-    cJSON *json = cJSON_CreateObject();
-    if (!json) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_ERR_NO_MEM;
-    }
-
-    char uptime[16];
-    snprintf(uptime, sizeof(uptime), "%02d:%02d:%02d", hrs, mins, secs);
-
-    cJSON_AddStringToObject(json, "state", "proxy");
-    cJSON_AddStringToObject(json, "fw", FW_VERSION);
-    cJSON_AddStringToObject(json, "miner_fw", miner_link_cached_version());
-    cJSON_AddBoolToObject(json, "wifi", wifi_manager_is_connected());
-    cJSON_AddStringToObject(json, "uptime", uptime);
-    cJSON_AddNumberToObject(json, "free_heap", (double)esp_get_free_heap_size());
-    /* Fragmentation, not total free, is what actually fails an allocation on a
-     * C3 — a device can report plenty free and still not find a contiguous
-     * block. Report both. */
-    cJSON_AddNumberToObject(json, "largest_block",
-        (double)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
-    cJSON_AddNumberToObject(json, "min_free", (double)esp_get_minimum_free_heap_size());
-
-    /* The miner's view of the ezShare card, from its last reported error.
-     * Absent until something has actually failed — which is the point: it
-     * answers "why did that request fail" rather than being a live probe. */
-    miner_ezshare_diag_t d;
-    miner_link_get_diag(&d);
-    if (d.valid) {
-        cJSON *ez = cJSON_AddObjectToObject(json, "ezshare");
-        if (ez) {
-            cJSON_AddBoolToObject(ez, "assoc", d.assoc);
-            cJSON_AddNumberToObject(ez, "rssi", d.rssi);
-            cJSON_AddNumberToObject(ez, "reason", d.reason);
-            int64_t age_s = (esp_timer_get_time() - d.when_us) / 1000000LL;
-            cJSON_AddNumberToObject(ez, "age_s", (double)age_s);   /* whole seconds */
-        }
-    }
-
-    char *out = cJSON_PrintUnformatted(json);
-    cJSON_Delete(json);
-    if (!out) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_ERR_NO_MEM;
-    }
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t rc = httpd_resp_sendstr(req, out);
-    free(out);
-    return rc;
-}
-
 void file_server_register(httpd_handle_t server)
 {
     httpd_uri_t uris[] = {
         { .uri = "/dir",            .method = HTTP_GET, .handler = handle_dir },
         { .uri = "/download",       .method = HTTP_GET, .handler = handle_download },
-        { .uri = "/api/status",     .method = HTTP_GET, .handler = handle_status },
         { .uri = "/o2ring/status",  .method = HTTP_GET, .handler = handle_o2ring_status },
         { .uri = "/o2ring/files",   .method = HTTP_GET, .handler = handle_o2ring_files },
         { .uri = "/o2ring/live",    .method = HTTP_GET, .handler = handle_o2ring_live },
     };
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++)
         httpd_register_uri_handler(server, &uris[i]);
-    ESP_LOGI(TAG, "Registered: /dir /download /api/status /o2ring/* (proxy mode)");
+    ESP_LOGI(TAG, "Registered: /dir /download and the o2ring routes");
 }

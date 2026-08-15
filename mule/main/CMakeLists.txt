@@ -6,6 +6,8 @@ idf_component_register(
         "nvs_config.c"
         "captive_portal.c"
         "file_server.c"
+        "control_server.c"
+        "log_ring.c"
         "miner_link.c"
         "mule_task.c"
     INCLUDE_DIRS "."

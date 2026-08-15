@@ -61,6 +61,9 @@
 #define O2RING_LIVE_TIMEOUT_MS      25000
 #define O2RING_DOWNLOAD_TIMEOUT_MS  120000
 
+// Local HTTP server (control page + proxy routes share one httpd)
+#define CONTROL_HTTP_PORT           80
+
 // Captive portal
 #define PORTAL_AP_CHANNEL           1
 #define PORTAL_MAX_CONN             2

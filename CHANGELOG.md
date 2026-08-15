@@ -57,6 +57,15 @@ can be updated without the other, so in the field they legitimately differ.
   only while `scanner_task` was the sole transmitter. Added ahead of the task
   split, so two interleaved writes can never produce one unparseable line plus
   one lost frame.
+- **A provisioned mule could never rejoin its network.** `nvs_config_has_wifi()`
+  probed the stored SSID with a 4-byte buffer, and `nvs_get_str` returns
+  `ESP_ERR_NVS_INVALID_LENGTH` rather than `ESP_OK` when the buffer is too
+  small, so any SSID of four characters or more was reported as absent. With
+  the stock `config.h` the Kconfig fallback is excluded by design, so the boot
+  path fell through to the captive portal on **every** boot: saved credentials
+  were written correctly and then never used. `has_ezshare()` had the identical
+  bug, which is why the mule never re-sent the card credentials to the miner.
+  Both now ask NVS for the required length instead of guessing at it.
 - **A mule reboot no longer restarts the miner.** The mule sends `set_config`
   on every boot and the miner restarted unconditionally to apply it — so a mule
   crash-and-recover took the miner down too, potentially mid-transfer. It now
@@ -88,6 +97,21 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Added
 
+- **A device page and a local control API.** Point a browser at the mule and you
+  get status, the SD card links, the O2 Ring switch, recent logs and the
+  maintenance actions. New `control_server.c` owns the single httpd and mounts
+  the existing data routes onto it, so everything shares one server and one
+  link lock. New endpoints: `GET /`, `POST /api/reboot` (mule, miner, or both),
+  `POST /api/reset`, `POST /api/config`, `GET /api/logs`.
+  Verified by driving the real page in a browser against a mocked device across
+  three states (card missing, card healthy, fresh boot with nothing failed
+  yet), with no console errors.
+- **`GET /api/logs`** and `log_ring.c`: an 8 KB ring of recent log lines
+  captured through `esp_log_set_vprintf`, with the ANSI colour codes stripped
+  so the output is readable in a browser or a pasted support log. The console
+  keeps its colours. Until now the only way to see what a unit was doing was a
+  USB cable, which is not a reasonable thing to ask of a box mounted behind a
+  CPAP machine.
 - **Control messages on the link**: `version_req`/`version_resp`, `reboot`,
   `reset`, `o2_state_req`/`o2_state_resp` and `o2_set_enabled`. `reboot` leaves
   the miner's config alone; `reset` erases it and lets the mule re-push

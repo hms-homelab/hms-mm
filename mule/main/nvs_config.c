@@ -27,6 +27,27 @@ static void write_str(const char *key, const char *val)
     nvs_commit(s_nvs);
 }
 
+/**
+ * Does this key hold a non-empty string?
+ *
+ * Asks NVS for the required length (out_value = NULL) rather than attempting a
+ * read into a probe buffer. The previous form passed a 4-byte stack buffer,
+ * and nvs_get_str returns ESP_ERR_NVS_INVALID_LENGTH — not ESP_OK — when the
+ * buffer is too small, so ANY stored value of four characters or more was
+ * reported as absent. For wifi_ssid that meant a provisioned mule went back to
+ * the captive portal on every boot; for ez_ssid it meant the miner was never
+ * sent its credentials.
+ *
+ * The returned length includes the terminator, so len <= 1 is an empty string.
+ * Treating that as "not set" is what lets a reset clear a key by writing "".
+ */
+static bool has_str(const char *key)
+{
+    if (!s_nvs) return false;
+    size_t len = 0;
+    return nvs_get_str(s_nvs, key, NULL, &len) == ESP_OK && len > 1;
+}
+
 void nvs_config_init(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -60,7 +81,7 @@ void nvs_config_init(void)
              nvs_config_has_ezshare() ? "yes" : "no");
 }
 
-bool nvs_config_has_wifi(void)     { char t[4]; return read_str("wifi_ssid", t, sizeof(t)); }
+bool nvs_config_has_wifi(void)     { return has_str("wifi_ssid"); }
 bool nvs_config_get_wifi_ssid(char *b, size_t s) { return read_str("wifi_ssid", b, s); }
 bool nvs_config_get_wifi_pass(char *b, size_t s) { return read_str("wifi_pass", b, s); }
 void nvs_config_set_wifi(const char *ssid, const char *pass)
@@ -70,7 +91,7 @@ void nvs_config_set_wifi(const char *ssid, const char *pass)
     ESP_LOGI(TAG, "WiFi stored (SSID: %s)", ssid);
 }
 
-bool nvs_config_has_ezshare(void)  { char t[4]; return read_str("ez_ssid", t, sizeof(t)); }
+bool nvs_config_has_ezshare(void)  { return has_str("ez_ssid"); }
 bool nvs_config_get_ezshare_ssid(char *b, size_t s) { return read_str("ez_ssid", b, s); }
 bool nvs_config_get_ezshare_pass(char *b, size_t s) { return read_str("ez_pass", b, s); }
 void nvs_config_set_ezshare(const char *ssid, const char *pass)
@@ -82,6 +103,24 @@ void nvs_config_set_ezshare(const char *ssid, const char *pass)
 
 bool nvs_config_get_serial(char *b, size_t s) { return read_str("serial", b, s); }
 void nvs_config_set_serial(const char *serial) { write_str("serial", serial); }
+
+void nvs_config_clear_wifi(void)
+{
+    /* Clear the home WiFi only. ezShare credentials and the serial survive, so
+     * a "reset WiFi" from the web UI puts the device back on the portal
+     * without forgetting the card it was paired with. */
+    write_str("wifi_ssid", "");
+    write_str("wifi_pass", "");
+    ESP_LOGW(TAG, "home WiFi credentials cleared");
+}
+
+void nvs_config_erase_all(void)
+{
+    if (!s_nvs) return;
+    nvs_erase_all(s_nvs);
+    nvs_commit(s_nvs);
+    ESP_LOGW(TAG, "mule NVS erased");
+}
 
 uint32_t nvs_config_increment_boot_count(void)
 {

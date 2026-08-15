@@ -129,20 +129,43 @@ curl -H "Range: bytes=1024-" "http://<MULE_IP>/download?file=STR.EDF" -o str_par
 
 ## HTTP API
 
-### ezShare SD Card
+Everything is served from one HTTP server on port 80. Point a browser at the
+mule's address for a device page with status, the SD card links, the O2 Ring
+switch, recent logs and the maintenance actions.
+
+### Device and control
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Redirects to `/dir?dir=A:` |
-| `/dir?dir=A:path` | GET | HTML directory listing (proxied from SD card) |
+| `/` | GET | Device page |
+| `/api/status` | GET | JSON device status (below) |
+| `/api/logs?n=120` | GET | Recent log lines as plain text. `n` tails the last N lines. |
+| `/api/reboot` | POST | Restart. Body `{"target":"mule"\|"miner"\|"both"}`, default `mule`. Config is kept. |
+| `/api/reset` | POST | Forget the home WiFi and return to the setup portal. Resets the miner too. The ezShare credentials and the serial are kept. |
+| `/api/config` | POST | `{"wifi_ssid","wifi_pass","ez_ssid","ez_pass"}` to write credentials, or `{"o2_enabled":bool}` on its own to toggle the O2 Ring without touching anything else. |
+
+### ezShare SD card
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/dir?dir=A:path` | GET | HTML directory listing (proxied from the card) |
 | `/download?file=path` | GET | Raw file download, supports `Range` header |
-| `/api/status` | GET | JSON device status |
-| `/api/reset` | POST | Clear WiFi credentials and reboot into captive portal |
 
 **`/api/status` response:**
 ```json
-{"state":"proxy","wifi":true,"mqtt":false,"o2ring":false,"uptime":"01:23:45"}
+{"serial":"MM-4F2A","fw":"2026.0.6","miner_fw":"2026.0.6","state":"proxy",
+ "wifi":true,"uptime":"01:23:45","rssi":-58,"free_heap":54321,
+ "largest_block":18000,"min_free":41000,"o2_enabled":false,
+ "ezshare":{"assoc":false,"rssi":0,"reason":201,"age_s":42}}
 ```
+
+`fw` and `miner_fw` can legitimately differ: the two boards version
+independently. `largest_block` is the largest contiguous free block and matters
+more than `free_heap` on a C3, where an allocation fails from fragmentation
+long before memory actually runs out. The `ezshare` object is the miner's view
+of the card from its last reported error, and is absent until something has
+failed, so it answers "why did that request fail" rather than acting as a live
+probe.
 
 **`/download` Range support:**
 ```

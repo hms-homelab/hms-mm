@@ -49,8 +49,16 @@ bool miner_link_reboot(void);
  *  credentials with set_config on its next boot. */
 bool miner_link_reset(void);
 
-/** Read the O2Ring BLE gate (miner NVS ble_active). */
+/** Read the O2Ring BLE gate (miner NVS ble_active). Hits the link. */
 bool miner_link_get_o2_enabled(bool *enabled);
+
+/**
+ * @brief Last known O2Ring gate state, without touching the link.
+ *
+ * /api/status uses this so that loading the page cannot interrupt a transfer
+ * in progress. Defaults to false, which matches the miner's own default.
+ */
+bool miner_link_cached_o2_enabled(void);
 
 /**
  * @brief Set the O2Ring BLE gate.

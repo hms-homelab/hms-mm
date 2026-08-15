@@ -24,4 +24,11 @@ void nvs_config_set_ezshare(const char *ssid, const char *pass);
 bool nvs_config_get_serial(char *buf, size_t buf_size);
 void nvs_config_set_serial(const char *serial);
 
+// Forget the home WiFi so the next boot lands on the captive portal. ezShare
+// credentials and the serial are kept.
+void nvs_config_clear_wifi(void);
+
+// Forget everything, including the serial (which is regenerated on next boot).
+void nvs_config_erase_all(void);
+
 uint32_t nvs_config_increment_boot_count(void);
