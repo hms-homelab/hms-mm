@@ -17,8 +17,7 @@ logs and the maintenance actions. No app, no account, no cloud.
 ## Architecture
 
 ```
-                         UART (921600 baud)
-WiFi SD Card AP          JSON + newline          Home Network
+WiFi SD Card AP       UART, newline JSON       Home Network
 (192.168.4.1)            TX/RX crossed           (your router)
     |                                                 |
     v  WiFi                                     WiFi  v
@@ -70,6 +69,25 @@ So take the mechanism, not the number. Acknowledging paces the miner to what
 the mule can absorb while it is busy on WiFi, and that holds however the boards
 are wired. `UART_BAUD_RATE` is the one knob, it must match on both boards, and
 if `/api/logs` shows chunk CRC mismatches, lower it.
+
+## Using the miner on its own
+
+The miner does not care what is on the other end of the UART. It speaks
+newline-delimited JSON and nothing else, so anything that can drive a 3.3 V
+serial port — a Raspberry Pi, a laptop with a USB-serial adapter, another
+microcontroller — can take the mule's place and get the same ezShare and
+O2Ring access. The mule is simply the implementation that ships here.
+
+If you write your own, two things are not optional:
+
+- **Acknowledge every chunk.** After each `proxy_chunk` that is not the last,
+  send `{"type":"chunk_ack","id":<id>,"seq":<seq>}` once you have actually
+  consumed the data. The miner blocks until it arrives and gives up after
+  `PROXY_CHUNK_ACK_TIMEOUT_MS`. This is the link's only flow control; skip it
+  and you will silently lose bytes on long transfers.
+- **Match the baud, and mind 3.3 V.** The C3's pins are not 5 V tolerant.
+
+See [UART Protocol](#uart-protocol) for the full message set.
 
 ## Setup
 
