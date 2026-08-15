@@ -42,7 +42,11 @@
 // tape board does the TX->RX crossover via the 180-deg module layout.
 // GPIO2 is a strapping pin but is always TX (idles high), so it stays boot-safe.
 #define UART_PORT_NUM               UART_NUM_1
-// MEASURED ON HARDWARE (Unit 6, 2026-08-15), not chosen on theory.
+// MEASURED ON HARDWARE (2026-08-15), not chosen on theory. NOTE the wiring:
+// this was a pair of C3s on a fabricated PCB, over two traces originally laid
+// out for a 10 MHz SPI bus. The project's own 3D-printed board is copper foil
+// tape in printed grooves, which is harsher, so treat this as an upper bound
+// and dial it down if CRC mismatches show up in /api/logs.
 //
 // There is no hardware flow control: the link is two wires. Chunk CRCs catch
 // corrupted frames, and on the bench a full 98 KB download from an ezShare card

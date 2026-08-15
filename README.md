@@ -7,6 +7,13 @@ Dual ESP32-C3 proxy bridge for WiFi SD cards and Wellue O2Ring oximeters. The mu
 
 Solves the "two WiFi networks" problem: WiFi SD cards create their own AP, so a single-radio device can't be on both the SD card's network and your home network simultaneously. Two ESP32-C3s, connected by UART, each handle one network. The miner also supports BLE connections to a Wellue O2Ring for oximetry data (SpO2, heart rate, stored session files).
 
+## The device page
+
+Point a browser at the mule for status, the SD card, firmware updates, recent
+logs and the maintenance actions. No app, no account, no cloud.
+
+<img src="docs/img/device-page.png" alt="hms-mm device page" width="380">
+
 ## Architecture
 
 ```
@@ -21,7 +28,7 @@ WiFi SD Card AP          JSON + newline          Home Network
 |  Connects to SD  |  proxy_req -->   |  HTTP server :80 |
 |  card WiFi on    |  <-- proxy_meta  |  Forwards /dir & |
 |  demand, streams |  <-- proxy_chunk |  /download to    |
-|  chunks back     |                  |  miner via UART  |
+|  chunks back     |  chunk_ack -->   |  miner via UART  |
 |                  |  o2ring_req -->  |                  |
 |  Connects to     |  <-- o2ring_*   |  /o2ring/* API   |
 |  O2Ring via BLE  |                  |                  |
@@ -34,11 +41,46 @@ WiFi SD Card AP          JSON + newline          Home Network
 **Request flow:**
 
 1. Client sends `GET /dir?dir=A:DATALOG` to the mule
-2. Mule acquires proxy mutex, sends `proxy_req` JSON over UART
-3. Miner connects to ezShare WiFi (on-demand), fetches from SD card
-4. Miner streams `proxy_meta` (HTTP status) + `proxy_chunk` (base64-encoded data) back
-5. Mule decodes chunks and streams them to the HTTP client
-6. Miner disconnects from ezShare WiFi after idle timeout (5 min)
+2. Mule takes the link lock and sends `proxy_req` over UART
+3. Miner connects to the ezShare WiFi on demand and fetches from the card
+4. Miner sends `proxy_meta` (status, length), then `proxy_chunk` frames
+5. Mule verifies each chunk, streams it to the HTTP client, then replies
+   `chunk_ack` — which is what releases the miner to send the next one
+6. Mule refuses to finalise the response unless the byte count matches the
+   length the card promised
+7. Miner disconnects from the ezShare WiFi after an idle timeout (5 min)
+
+### Why every chunk is acknowledged
+
+The link is two wires. There is no hardware flow control, so if the miner
+streams at wire speed while the mule is still decoding the previous chunk and
+pushing it out over WiFi, the surplus is simply lost. Chunk CRCs catch that but
+cannot repair it. Acknowledging each chunk paces the miner to what the mule
+actually absorbs.
+
+Measured on real hardware, downloading the same 98 KB file from an ezShare
+card:
+
+| | completed | link errors |
+|---|---|---|
+| free-running, 921600 baud | 0/6 | constant CRC mismatches |
+| free-running, 460800 baud | 7/10 | CRC mismatches |
+| free-running, 230400 baud | 5/10 | CRC mismatches |
+| **acknowledged, 460800 baud** | **19/20, then 10/10** | **none** |
+
+Lowering the baud never helped monotonically, which is what ruled out raw speed
+and pointed at flow control. Acknowledging is also *faster* in practice
+(~12 KB/s), because a corrupted transfer is wasted entirely. The ezShare card,
+not the link, is now the bottleneck — which is where it should be.
+
+**Read the baud numbers with the wiring in mind.** They were measured on a pair
+of C3s joined by a fabricated PCB, using two traces originally laid out for a
+10 MHz SPI bus. The 3D-printed board below is copper foil tape pressed into
+printed grooves, which is a harsher electrical environment, so treat 460800 as
+"what held up on good traces" rather than as a universal answer — dial it down
+if your wiring shows CRC mismatches in `/api/logs`. The acknowledgement itself
+is not hardware-specific: it fixes the mule being starved of the bus while it
+is busy on WiFi, which no amount of clean wiring changes.
 
 ## Setup
 
@@ -95,6 +137,9 @@ idf.py -p /dev/cu.usbmodemYYYY flash
 ```
 
 ### 4. Configure WiFi (Captive Portal)
+
+<img src="docs/img/setup-portal.png" alt="hms-mm setup portal" width="300">
+
 
 On first boot (or after `idf.py erase-flash`), the mule creates an open WiFi AP:
 
@@ -157,6 +202,8 @@ switch, recent logs and the maintenance actions.
 | `/api/config` | POST | `{"wifi_ssid","wifi_pass","ez_ssid","ez_pass"}` to write credentials, or `{"o2_enabled":bool}` on its own to toggle the O2 Ring without touching anything else. |
 
 ### Firmware update
+
+<img src="docs/img/firmware-page.png" alt="hms-mm firmware page" width="300">
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -240,9 +287,10 @@ WiFi and BLE share the ESP32-C3 radio, so they run sequentially — the miner di
 
 ## UART Protocol
 
-Newline-delimited JSON at 921600 baud — one frame per line, so the link stays
+Newline-delimited JSON at 460800 baud — one frame per line, so the link stays
 readable in a serial monitor. Both boards must run the same baud, so a change
-here means reflashing the pair.
+here means reflashing the pair. The rate is measured rather than chosen; see
+[Why every chunk is acknowledged](#why-every-chunk-is-acknowledged).
 
 ### Mule -> Miner
 
@@ -282,6 +330,17 @@ here means reflashing the pair.
   double, since a CRC above 2^31 will not fit a 32-bit signed int.
 - `d` — base64-encoded binary data
 - `last` — true on final chunk
+
+**Chunk acknowledgement (mule -> miner):**
+```json
+{"type":"chunk_ack","id":1,"seq":0}
+```
+Sent only once the decoded bytes have been handed to the HTTP client. The miner
+blocks after every non-final chunk until this arrives, which is the link's only
+flow control. No ack is sent for the final chunk: the mule finalises the
+response rather than asking for more. A miner that waits
+`PROXY_CHUNK_ACK_TIMEOUT_MS` (10 s) without hearing one gives up on the
+transfer. `proxy_abort` arriving instead of an ack means the client went away.
 
 **Error:**
 ```json
