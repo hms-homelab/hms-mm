@@ -9,6 +9,18 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Breaking — flash both boards together
 
+- **Partition table now has two OTA slots.** `factory` is replaced by
+  `otadata` + `ota_0` + `ota_1`, which is what makes firmware updates possible
+  at all. A flash layout cannot be changed over the air, so moving to this
+  release needs **one USB flash at offset 0x0** on each board:
+  ```
+  esptool.py --chip esp32c3 -p PORT write_flash 0x0 mule-VERSION-merged.bin
+  esptool.py --chip esp32c3 -p PORT write_flash 0x0 miner-VERSION-merged.bin
+  ```
+  The `*-merged.bin` images published with each release contain the bootloader,
+  the partition table and the app together. Every update after this one can go
+  over the network. Note the app partition shrinks from 0x1F0000 to 0x1E0000,
+  because two slots and otadata now share the same 4 MB.
 - **UART baud 115200 to 921600.** The boards must agree on the baud, so a unit
   running a mix of old and new firmware will not talk at all. Reflash the pair.
   Raw link capacity goes from ~11.5 KB/s to ~92 KB/s; after base64's 4/3 tax
@@ -97,6 +109,31 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Added
 
+- **Firmware updates, over the network or by upload.** `POST /api/ota` takes
+  `{"target","url"}` and the device fetches and installs it itself;
+  `POST /api/update/{mule,miner}` takes the raw `.bin` in the body and needs no
+  network at all. The miner is updated through the mule over the link, since it
+  has no network of its own. `GET /api/update` is a page for both, with live
+  progress. Nothing polls for updates: the device contacts a server only when
+  you hand it a URL.
+  `https://` is verified against the bundled root certificates
+  (`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`, matching the sibling project) because
+  this installs executable code and an unverified connection would let anyone
+  on the network path choose the firmware.
+- **Rollback protection.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` on both
+  boards, so a new image boots on probation and the bootloader reverts unless
+  the app confirms itself. The mule confirms once WiFi and the server are up.
+  The miner confirms on the first frame it successfully decodes from the mule,
+  and reboots unconfirmed after 180 s if it never manages one: the link is its
+  only route in, so an image that boots but cannot talk is otherwise
+  unrecoverable without opening the case. A decoded frame is the proof; noise
+  on the wire must never count.
+- **An update locks out conflicting work.** Every route that drives the miner
+  or changes configuration answers `503` with `Retry-After` while an update is
+  running, and the miner refuses anything that is not an OTA frame for the
+  duration. Both halves are needed: the HTTP gate does nothing about frames
+  already on the wire, and the miner gate turns a well-formed request into
+  silence rather than a diagnosable error.
 - **A device page and a local control API.** Point a browser at the mule and you
   get status, the SD card links, the O2 Ring switch, recent logs and the
   maintenance actions. New `control_server.c` owns the single httpd and mounts

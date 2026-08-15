@@ -9,6 +9,7 @@
 #include "file_server.h"
 #include "uart_handler.h"
 #include "miner_link.h"
+#include "ota_service.h"
 #include "wifi_manager.h"
 #include "config.h"
 #include "esp_log.h"
@@ -443,6 +444,8 @@ static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
 
 static esp_err_t handle_o2ring_status(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     if (!uart_link_lock(PROXY_LOCK_ACQUIRE_MS)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
@@ -471,6 +474,8 @@ static esp_err_t handle_o2ring_status(httpd_req_t *req)
 
 static esp_err_t handle_o2ring_files(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     char query[512] = {0};
     char name_param[64] = {0};
     bool has_name = false;
@@ -632,6 +637,8 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
 
 static esp_err_t handle_o2ring_live(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     if (!uart_link_lock(PROXY_LOCK_ACQUIRE_MS)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
@@ -662,6 +669,8 @@ static esp_err_t handle_o2ring_live(httpd_req_t *req)
 
 static esp_err_t handle_dir(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     char query[MAX_PATH * 2] = {0};
     char dir_param[MAX_PATH] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
@@ -680,6 +689,8 @@ static esp_err_t handle_dir(httpd_req_t *req)
 
 static esp_err_t handle_download(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     char query[MAX_PATH * 2] = {0};
     char file_param[MAX_PATH] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||

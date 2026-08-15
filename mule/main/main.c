@@ -23,6 +23,7 @@
 #include "file_server.h"
 #include "control_server.h"
 #include "log_ring.h"
+#include "ota_service.h"
 #include "mule_task.h"
 #include "config.h"
 
@@ -76,6 +77,11 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }
+
+    /* WiFi is up and the server is serving, which is as much as this board can
+     * prove about itself. Confirm now so the bootloader stops holding the old
+     * image in reserve. */
+    ota_service_confirm_boot();
 
     mule_task_init();
     mule_task_start();

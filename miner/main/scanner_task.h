@@ -7,6 +7,7 @@ typedef enum {
     SCANNER_IDLE,           // Waiting for UART proxy_req or set_config
     SCANNER_PROXY,          // Connected to ezShare, streaming response
     SCANNER_O2RING,         // Handling O2Ring BLE request
+    SCANNER_OTA,            // Receiving a firmware image; accepts only OTA frames
     SCANNER_ERROR           // Error state (retry)
 } scanner_state_t;
 

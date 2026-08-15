@@ -102,14 +102,16 @@ On save:
 - Miner stores SD card credentials in NVS
 - Both devices reboot with the new credentials
 
-Credentials persist across reboots. To re-enter setup, erase flash: `idf.py erase-flash`.
+Credentials persist across reboots. To re-enter setup, use **Reset Wi-Fi** on the
+device page (or `POST /api/reset`), which keeps the card settings. `idf.py
+erase-flash` also works and forgets everything.
 
 ### 5. Test
 
 ```bash
 # Check mule is up
 curl "http://<MULE_IP>/api/status"
-# {"state":"proxy","wifi":true,"mqtt":false,"uptime":"00:05:23"}
+# {"serial":"MM-4F2A","fw":"2026.0.6","miner_fw":"2026.0.6","wifi":true,...}
 
 # List root directory
 curl "http://<MULE_IP>/dir?dir=A:"
@@ -143,6 +145,25 @@ switch, recent logs and the maintenance actions.
 | `/api/reboot` | POST | Restart. Body `{"target":"mule"\|"miner"\|"both"}`, default `mule`. Config is kept. |
 | `/api/reset` | POST | Forget the home WiFi and return to the setup portal. Resets the miner too. The ezShare credentials and the serial are kept. |
 | `/api/config` | POST | `{"wifi_ssid","wifi_pass","ez_ssid","ez_pass"}` to write credentials, or `{"o2_enabled":bool}` on its own to toggle the O2 Ring without touching anything else. |
+
+### Firmware update
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/update` | GET | Update page |
+| `/api/ota` | POST | `{"target":"mule"\|"miner","url":"..."}`. The device fetches and installs it, so the address must be reachable **from the device**. Returns `202`; follow progress in `/api/status`. |
+| `/api/update/mule` · `/api/update/miner` | POST | Raw `.bin` in the body. Needs no network at all. |
+| `/api/cancel_update` | POST | Abandon a URL pull in progress |
+
+Nothing polls for updates. The device contacts a server only when you hand it a
+URL. `https://` is verified against the bundled root certificates, because this
+installs executable code; `http://` from a NAS or a laptop skips TLS and is the
+lighter path on a LAN.
+
+While an update runs, every route that drives the miner or changes
+configuration answers `503` with `Retry-After`. `/api/status`, `/api/logs` and
+`/api/cancel_update` stay available, since those are how you watch an update
+and how you stop one.
 
 ### ezShare SD card
 
@@ -288,6 +309,20 @@ Small request/response exchanges, all mule -> miner unless noted.
 | `{"type":"reset"}` | `{"type":"ack","of":"reset"}` | Erase miner config and restart; the mule re-pushes credentials on its next boot |
 | `{"type":"o2_state_req"}` | `{"type":"o2_state_resp","enabled":false}` | Read the O2Ring BLE gate |
 | `{"type":"o2_set_enabled","enabled":true}` | `{"type":"o2_state_resp","enabled":true}` | Set the gate. The miner restarts to apply it, since the BLE stack is only brought up at init. A no-op change does not restart. |
+
+**Firmware update** (mule -> miner), which the mule drives from either an HTTP
+download or a body upload:
+
+```json
+{"type":"ota_begin","total":1714912}
+{"type":"ota_chunk","off":0,"c":2276608578,"d":"<base64>"}
+{"type":"ota_finish"}
+```
+Each frame is acknowledged before the next is sent. `off` is checked against
+the miner's own byte count, so a dropped or duplicated chunk fails the transfer
+instead of quietly writing a misaligned image, and `c` is verified before the
+bytes reach flash. While a transfer is open the miner accepts only `ota_chunk`,
+`ota_finish` and `ota_abort`, and refuses everything else with `OTA_BUSY`.
 
 An `ack` may be lost — the miner can restart before it drains — so a missing
 ack is not proof the command was ignored.

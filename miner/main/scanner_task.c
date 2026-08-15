@@ -20,6 +20,7 @@
 #include "nvs_config.h"
 #include "config.h"
 #include "o2ring_ble.h"
+#include "ota_handler.h"
 
 static const char *TAG = LOG_TAG_SCANNER;
 
@@ -416,6 +417,110 @@ static void handle_reboot(void)
     reply_then_restart("reboot");
 }
 
+/* ── OTA ──────────────────────────────────────────────────────────
+ *
+ * Entering SCANNER_OTA is the miner's half of the update gate: while an image
+ * is being written, the dispatcher below accepts ota_chunk and ota_finish and
+ * nothing else. The mule refuses conflicting HTTP requests at its own edge,
+ * but that only covers requests arriving over HTTP; this covers the wire.
+ */
+
+/* Decoded chunk payload. static, not stack: the scanner task has 8 KB and
+ * these two buffers are 9 KB together. Safe because only this task touches
+ * them, and only while an OTA is open. */
+static uint8_t s_ota_bin[FILE_CHUNK_SIZE];
+static char    s_ota_b64[B64_BUF_SIZE];
+
+static void send_ack(const char *of)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+    cJSON_AddStringToObject(root, "type", "ack");
+    cJSON_AddStringToObject(root, "of", of);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
+
+static void handle_ota_begin(cJSON *root)
+{
+    cJSON *tot = cJSON_GetObjectItem(root, "total");
+    if (!cJSON_IsNumber(tot) || tot->valuedouble <= 0) {
+        send_error_json(0, "ota_begin without a size", "OTA_BAD_ARG");
+        return;
+    }
+    esp_err_t err = miner_ota_begin((uint32_t)tot->valuedouble);
+    if (err != ESP_OK) {
+        send_error_json(0, esp_err_to_name(err), "OTA_BEGIN_FAILED");
+        return;
+    }
+    current_state = SCANNER_OTA;
+    send_ack("ota_begin");
+}
+
+/* Returns false when the transfer has ended, either way. */
+static bool handle_ota_chunk(cJSON *root)
+{
+    cJSON *off_j = cJSON_GetObjectItem(root, "off");
+    cJSON *d_j   = cJSON_GetObjectItem(root, "d");
+    cJSON *crc_j = cJSON_GetObjectItem(root, "c");
+    if (!cJSON_IsNumber(off_j) || !cJSON_IsString(d_j)) {
+        send_error_json(0, "malformed ota_chunk", "OTA_BAD_CHUNK");
+        miner_ota_abort();
+        return false;
+    }
+
+    size_t b64_len = strlen(d_j->valuestring);
+    if (b64_len >= sizeof(s_ota_b64)) {
+        send_error_json(0, "ota_chunk too large", "OTA_BAD_CHUNK");
+        miner_ota_abort();
+        return false;
+    }
+    memcpy(s_ota_b64, d_j->valuestring, b64_len);
+
+    size_t bin_len = 0;
+    if (mbedtls_base64_decode(s_ota_bin, sizeof(s_ota_bin), &bin_len,
+                              (const unsigned char *)s_ota_b64, b64_len) != 0) {
+        send_error_json(0, "ota_chunk failed to decode", "OTA_BAD_CHUNK");
+        miner_ota_abort();
+        return false;
+    }
+
+    /* Verify before writing. Flashing a corrupt chunk and finding out at
+     * esp_ota_end means the whole transfer is wasted; worse, a corruption that
+     * still passes the image hash would be written permanently. */
+    if (cJSON_IsNumber(crc_j)) {
+        uint32_t want = (uint32_t)crc_j->valuedouble;
+        uint32_t got  = esp_rom_crc32_le(0, s_ota_bin, bin_len);
+        if (got != want) {
+            ESP_LOGE(TAG, "ota_chunk CRC mismatch at offset %lu",
+                     (unsigned long)off_j->valuedouble);
+            send_error_json(0, "ota_chunk CRC mismatch", "OTA_CRC");
+            miner_ota_abort();
+            return false;
+        }
+    }
+
+    if (miner_ota_write((uint32_t)off_j->valuedouble, s_ota_bin, bin_len) != ESP_OK) {
+        send_error_json(0, "ota_chunk write failed", "OTA_WRITE");
+        return false;                    /* miner_ota_write already aborted */
+    }
+    send_ack("ota_chunk");
+    return true;
+}
+
+static void handle_ota_finish(void)
+{
+    esp_err_t err = miner_ota_finish();
+    if (err != ESP_OK) {
+        send_error_json(0, esp_err_to_name(err), "OTA_FINISH_FAILED");
+        current_state = SCANNER_IDLE;
+        return;
+    }
+    send_ack("ota_finish");
+    reply_then_restart("ota_finish");
+}
+
 static void handle_o2_state_req(void)
 {
     send_simple("o2_state_resp", "enabled", cJSON_CreateBool(nvs_config_ble_active()));
@@ -451,6 +556,9 @@ static void scanner_task_loop(void *pvParameters)
         switch (current_state) {
             case SCANNER_IDLE: {
                 check_idle_disconnect();
+                /* Roll back if a freshly written image has run out of time to
+                 * show it can still hear the mule. */
+                miner_ota_check_rollback_deadline();
 
                 int len = uart_receive_json(uart_buf, sizeof(uart_buf), 1000);
                 if (len <= 0) {
@@ -460,6 +568,11 @@ static void scanner_task_loop(void *pvParameters)
 
                 cJSON *root = cJSON_Parse(uart_buf);
                 if (!root) break;
+
+                /* A frame that parsed is proof the link works, which is what a
+                 * pending image needs to confirm itself. Noise must never
+                 * count, so this sits after the parse, not after the read. */
+                miner_ota_confirm_boot();
 
                 cJSON *type = cJSON_GetObjectItem(root, "type");
                 if (!type || !cJSON_IsString(type)) { cJSON_Delete(root); break; }
@@ -476,6 +589,8 @@ static void scanner_task_loop(void *pvParameters)
                     handle_o2_state_req();
                 } else if (strcmp(type->valuestring, "o2_set_enabled") == 0) {
                     handle_o2_set_enabled(root);
+                } else if (strcmp(type->valuestring, "ota_begin") == 0) {
+                    handle_ota_begin(root);
                 } else if (strcmp(type->valuestring, "o2ring_req") == 0) {
                     cJSON *id_j  = cJSON_GetObjectItem(root, "id");
                     cJSON *cmd_j = cJSON_GetObjectItem(root, "cmd");
@@ -633,6 +748,47 @@ static void scanner_task_loop(void *pvParameters)
                     send_error_json(o2ring_req_id, "Unknown o2ring command", "INVALID_CMD");
                 }
                 current_state = SCANNER_IDLE;
+                break;
+            }
+
+            case SCANNER_OTA: {
+                /* The gate: while an image is being written, only OTA frames
+                 * are honoured. Anything else is refused rather than ignored,
+                 * so a client that asks for a file mid-update gets an error it
+                 * can act on instead of a silence it has to time out.
+                 *
+                 * The timeout is generous because the mule pauses between
+                 * chunks to read its own source (HTTP body or network), but it
+                 * is not unbounded: a mule that dies mid-transfer must not
+                 * leave the miner stuck here forever. */
+                int len = uart_receive_json(uart_buf, sizeof(uart_buf), 30000);
+                if (len <= 0) {
+                    ESP_LOGE(TAG, "OTA: no frame from the mule — abandoning");
+                    miner_ota_abort();
+                    current_state = SCANNER_IDLE;
+                    break;
+                }
+
+                cJSON *root = cJSON_Parse(uart_buf);
+                if (!root) break;
+                cJSON *type = cJSON_GetObjectItem(root, "type");
+                if (!type || !cJSON_IsString(type)) { cJSON_Delete(root); break; }
+
+                if (strcmp(type->valuestring, "ota_chunk") == 0) {
+                    if (!handle_ota_chunk(root)) current_state = SCANNER_IDLE;
+                } else if (strcmp(type->valuestring, "ota_finish") == 0) {
+                    handle_ota_finish();      /* restarts on success */
+                } else if (strcmp(type->valuestring, "ota_abort") == 0) {
+                    ESP_LOGW(TAG, "OTA abandoned by the mule");
+                    miner_ota_abort();
+                    send_ack("ota_abort");
+                    current_state = SCANNER_IDLE;
+                } else {
+                    ESP_LOGW(TAG, "'%s' refused: a firmware update is in progress",
+                             type->valuestring);
+                    send_error_json(0, "firmware update in progress", "OTA_BUSY");
+                }
+                cJSON_Delete(root);
                 break;
             }
 

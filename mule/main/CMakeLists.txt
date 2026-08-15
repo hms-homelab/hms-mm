@@ -9,6 +9,8 @@ idf_component_register(
         "control_server.c"
         "log_ring.c"
         "miner_link.c"
+        "ota_miner.c"
+        "ota_service.c"
         "mule_task.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -19,6 +21,9 @@ idf_component_register(
         json
         lwip
         mdns
+        app_update
+        esp_http_client
+        esp-tls
     PRIV_REQUIRES
         mbedtls
         esp_timer

@@ -8,6 +8,7 @@
 #include "log_ring.h"
 #include "file_server.h"
 #include "miner_link.h"
+#include "ota_service.h"
 #include "nvs_config.h"
 #include "wifi_manager.h"
 
@@ -78,6 +79,10 @@ static const char PAGE_HTML[] =
 "<div id='o2b'></div>"
 "<p class='note'>The ring and the SD card share one radio, so enabling "
 "Bluetooth interrupts card transfers. Leave it off unless you use a ring.</p>"
+"</div>"
+
+"<div class='card'><h3>Firmware</h3>"
+"<a class='btn' href='/api/update'>Update firmware</a>"
 "</div>"
 
 "<div class='card'><h3>Logs</h3>"
@@ -198,6 +203,19 @@ static esp_err_t handle_status(httpd_req_t *req)
      * read or written explicitly. */
     cJSON_AddBoolToObject(json, "o2_enabled", miner_link_cached_o2_enabled());
 
+    /* Update progress, so the firmware page can follow a pull it started and
+     * a caller can tell "busy" from "wedged". */
+    ota_status_t ota;
+    ota_service_get_status(&ota);
+    cJSON *upd = cJSON_AddObjectToObject(json, "update");
+    if (upd) {
+        cJSON_AddStringToObject(upd, "state", ota.state_str);
+        cJSON_AddStringToObject(upd, "target", ota.target ? ota.target : "");
+        cJSON_AddNumberToObject(upd, "written", (double)ota.written);
+        cJSON_AddNumberToObject(upd, "total", (double)ota.total);
+        if (ota.error) cJSON_AddStringToObject(upd, "error", ota.error);
+    }
+
     miner_ezshare_diag_t d;
     miner_link_get_diag(&d);
     if (d.valid) {
@@ -236,6 +254,8 @@ static void restart_task(void *arg)
 
 static esp_err_t handle_reboot(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     cJSON *body = read_json_body(req);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
@@ -267,6 +287,8 @@ static esp_err_t handle_reboot(httpd_req_t *req)
 
 static esp_err_t handle_reset(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     /* Reset the miner first, while the link is still up: doing it after the
      * mule reboots would mean nothing is left to send the message. */
     if (!miner_link_reset())
@@ -284,6 +306,8 @@ static esp_err_t handle_reset(httpd_req_t *req)
 
 static esp_err_t handle_config(httpd_req_t *req)
 {
+    if (ota_service_reject_if_busy(req)) return ESP_FAIL;
+
     cJSON *body = read_json_body(req);
     if (!body) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
@@ -364,6 +388,7 @@ esp_err_t control_server_start(void)
         httpd_register_uri_handler(s_server, &uris[i]);
 
     log_ring_register(s_server);      /* GET /api/logs */
+    ota_service_register(s_server);   /* /api/update[...], /api/ota, /api/cancel_update */
     file_server_register(s_server);   /* /dir, /download, o2ring endpoints */
 
     ESP_LOGI(TAG, "Control server up on port %d", CONTROL_HTTP_PORT);

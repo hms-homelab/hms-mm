@@ -7,6 +7,7 @@ idf_component_register(
         "scanner_task.c"
         "nvs_config.c"
         "o2ring_ble.c"
+        "ota_handler.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -15,6 +16,7 @@ idf_component_register(
         driver
         json
         bt
+        app_update
     PRIV_REQUIRES
         mbedtls
         esp_timer

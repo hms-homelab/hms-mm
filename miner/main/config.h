@@ -58,6 +58,13 @@
 #define MAX_DATE_FOLDERS            10
 #define JSON_BUFFER_SIZE            4096
 
+// OTA rollback watchdog: how long a freshly written, still-unconfirmed image
+// has to decode a frame from the mule before it reboots and lets the
+// bootloader revert. Generous, because the mule's own boot can legitimately be
+// slow, and the cost of being wrong in this direction is a needless rollback
+// while the cost in the other direction is a miner nobody can reach.
+#define MINER_OTA_CONFIRM_TIMEOUT_MS 180000
+
 // O2Ring BLE
 #define O2RING_CONNECT_TIMEOUT_MS   15000
 #define O2RING_CMD_TIMEOUT_MS       10000

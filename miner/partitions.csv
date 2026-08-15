@@ -1,4 +1,10 @@
-# Name,   Type,  SubType, Offset,   Size,    Flags
-nvs,      data,  nvs,     0x9000,   0x6000,
-phy_init, data,  phy,     0xf000,   0x1000,
-factory,  app,   factory, 0x10000,  0x1F0000,
+# Name,   Type, SubType, Offset,   Size,    Flags
+# Dual OTA slots. BREAKING vs the old single-factory layout: this cannot be
+# delivered over the air, so moving to it needs one USB flash at 0x0.
+# ota_0/ota_1 are 0x1E0000 each, slightly smaller than the old factory
+# partition, because otadata and two slots have to share the same 4 MB.
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x1E0000,
+ota_1,    app,  ota_1,   0x200000, 0x1E0000,
