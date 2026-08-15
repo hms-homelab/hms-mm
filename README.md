@@ -70,25 +70,6 @@ the mule can absorb while it is busy on WiFi, and that holds however the boards
 are wired. `UART_BAUD_RATE` is the one knob, it must match on both boards, and
 if `/api/logs` shows chunk CRC mismatches, lower it.
 
-## Using the miner on its own
-
-The miner does not care what is on the other end of the UART. It speaks
-newline-delimited JSON and nothing else, so anything that can drive a 3.3 V
-serial port — a Raspberry Pi, a laptop with a USB-serial adapter, another
-microcontroller — can take the mule's place and get the same ezShare and
-O2Ring access. The mule is simply the implementation that ships here.
-
-If you write your own, two things are not optional:
-
-- **Acknowledge every chunk.** After each `proxy_chunk` that is not the last,
-  send `{"type":"chunk_ack","id":<id>,"seq":<seq>}` once you have actually
-  consumed the data. The miner blocks until it arrives and gives up after
-  `PROXY_CHUNK_ACK_TIMEOUT_MS`. This is the link's only flow control; skip it
-  and you will silently lose bytes on long transfers.
-- **Match the baud, and mind 3.3 V.** The C3's pins are not 5 V tolerant.
-
-See [UART Protocol](#uart-protocol) for the full message set.
-
 ## Setup
 
 ### 1. Install ESP-IDF
@@ -314,6 +295,17 @@ here means reflashing the pair. The rate is measured rather than chosen; see
 {"type":"set_config","ez_ssid":"ez Share","ez_pass":"88888888"}
 ```
 
+**Chunk acknowledgement (mule -> miner):**
+```json
+{"type":"chunk_ack","id":1,"seq":0}
+```
+Sent only once the decoded bytes have been handed to the HTTP client. The miner
+blocks after every non-final chunk until this arrives, which is the link's only
+flow control. No ack is sent for the final chunk: the mule finalises the
+response rather than asking for more. A miner that waits
+`PROXY_CHUNK_ACK_TIMEOUT_MS` (10 s) without hearing one gives up on the
+transfer. `proxy_abort` arriving instead of an ack means the client went away.
+
 ### Miner -> Mule
 
 **Proxy metadata (sent before first chunk):**
@@ -338,16 +330,6 @@ here means reflashing the pair. The rate is measured rather than chosen; see
 - `d` — base64-encoded binary data
 - `last` — true on final chunk
 
-**Chunk acknowledgement (mule -> miner):**
-```json
-{"type":"chunk_ack","id":1,"seq":0}
-```
-Sent only once the decoded bytes have been handed to the HTTP client. The miner
-blocks after every non-final chunk until this arrives, which is the link's only
-flow control. No ack is sent for the final chunk: the mule finalises the
-response rather than asking for more. A miner that waits
-`PROXY_CHUNK_ACK_TIMEOUT_MS` (10 s) without hearing one gives up on the
-transfer. `proxy_abort` arriving instead of an ack means the client went away.
 
 **Error:**
 ```json
