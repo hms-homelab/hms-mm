@@ -68,6 +68,14 @@ esp_err_t o2ring_ble_read_sensors(void);
 /** Get cached live reading (from last read_sensors call). */
 const o2ring_live_t *o2ring_ble_get_live(void);
 
+/**
+ * Download a .vld into a caller-provided buffer.
+ *
+ * NOT used by the scanner, which streams instead (below). Buffering a whole
+ * file needs as much contiguous heap as the file is large, which on this board
+ * both caps the file size and competes with everything else. Prefer the
+ * streaming form unless you genuinely need the bytes in one piece.
+ */
 esp_err_t o2ring_ble_download_file(const char *filename,
                                     uint8_t *out_buf, size_t buf_size,
                                     size_t *out_len);

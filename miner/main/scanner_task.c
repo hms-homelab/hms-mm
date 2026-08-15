@@ -39,7 +39,6 @@ static int o2ring_req_id = 0;
 static char o2ring_cmd[16] = {0};
 static char o2ring_filename[O2RING_MAX_FILENAME] = {0};
 
-#define O2RING_DL_BUF_SIZE (48 * 1024)
 
 /* Current proxy request */
 static int proxy_req_id = 0;
@@ -367,6 +366,28 @@ static void handle_set_config(cJSON *root)
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
     }
+}
+
+/* ── O2Ring streaming download ─────────────────────────────────── */
+
+typedef struct {
+    int    req_id;
+    size_t seq;
+    bool   failed;
+} o2_dl_ctx_t;
+
+/* One BLE block, straight onto the link. Returning false unwinds the download
+ * inside o2ring_ble, so a link that has stopped accepting frames stops the
+ * BLE read too rather than pulling the rest of a file nobody is reading. */
+static bool o2_dl_chunk_cb(const uint8_t *data, size_t len, uint32_t offset, void *ctx)
+{
+    o2_dl_ctx_t *c = (o2_dl_ctx_t *)ctx;
+    if (send_proxy_chunk(c->req_id, c->seq, false, data, len) != ESP_OK) {
+        c->failed = true;
+        return false;
+    }
+    c->seq++;
+    return true;
 }
 
 /* ── Control messages from the mule ────────────────────────────── */
@@ -711,39 +732,39 @@ static void scanner_task_loop(void *pvParameters)
                     /* Refresh info to ensure file list is current */
                     o2ring_ble_refresh_info();
 
-                    /* Heap-allocate download buffer (WiFi is off, ~60KB free) */
-                    uint8_t *dl_buf = malloc(O2RING_DL_BUF_SIZE);
-                    if (!dl_buf) {
-                        send_error_json(o2ring_req_id, "Out of memory", "OOM");
-                        current_state = SCANNER_IDLE;
-                        break;
-                    }
+                    /* Stream each BLE block straight onto the link instead of
+                     * assembling the whole file first. The old path malloc'd a
+                     * 48 KB buffer on a board whose free heap is measured in
+                     * tens of KB, and capped downloads at that size for files
+                     * the README itself says run 30-50 KB. Nothing is buffered
+                     * now, so the ceiling is gone and so is the allocation.
+                     *
+                     * The size is not known until the transfer ends, so the
+                     * meta goes out with length 0 (the mule streams chunked
+                     * and ignores it here) and a final empty chunk carries the
+                     * end marker. */
+                    send_proxy_meta(o2ring_req_id, 200, 0, 0);
 
+                    o2_dl_ctx_t dctx = { .req_id = o2ring_req_id, .seq = 0, .failed = false };
                     size_t out_len = 0;
-                    esp_err_t ret = o2ring_ble_download_file(o2ring_filename, dl_buf,
-                                                             O2RING_DL_BUF_SIZE, &out_len);
-                    if (ret != ESP_OK || out_len == 0) {
+                    esp_err_t ret = o2ring_ble_download_file_stream(
+                        o2ring_filename, o2_dl_chunk_cb, &dctx, &out_len);
+
+                    if (ret != ESP_OK || dctx.failed || out_len == 0) {
+                        /* Chunks may already be on the wire, so the mule has to
+                         * learn this failed rather than wait for an end marker
+                         * that is never coming. */
+                        ESP_LOGE(TAG, "O2Ring download failed after %u chunk(s)",
+                                 (unsigned)dctx.seq);
                         send_error_json(o2ring_req_id, "File download failed", "BLE_READ_FAIL");
-                        free(dl_buf);
                         current_state = SCANNER_IDLE;
                         break;
                     }
 
-                    /* Send proxy_meta with actual size, then chunked data */
-                    send_proxy_meta(o2ring_req_id, 200, (uint32_t)out_len, 0);
-
-                    size_t offset = 0;
-                    size_t seq = 0;
-                    while (offset < out_len) {
-                        size_t chunk_len = out_len - offset;
-                        if (chunk_len > FILE_CHUNK_SIZE) chunk_len = FILE_CHUNK_SIZE;
-                        bool is_last = (offset + chunk_len >= out_len);
-                        send_proxy_chunk(o2ring_req_id, seq, is_last,
-                                         dl_buf + offset, chunk_len);
-                        offset += chunk_len;
-                        seq++;
-                    }
-                    free(dl_buf);
+                    static const uint8_t empty = 0;
+                    send_proxy_chunk(o2ring_req_id, dctx.seq, true, &empty, 0);
+                    ESP_LOGI(TAG, "O2Ring download complete: %u B in %u chunk(s)",
+                             (unsigned)out_len, (unsigned)dctx.seq);
                 } else {
                     send_error_json(o2ring_req_id, "Unknown o2ring command", "INVALID_CMD");
                 }

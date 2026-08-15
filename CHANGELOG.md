@@ -122,6 +122,14 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Changed
 
+- **O2Ring downloads stream instead of buffering.** The download path
+  `malloc`'d 48 KB and assembled the whole file before sending any of it, on a
+  board whose free heap is measured in tens of KB, and that capped downloads at
+  48 KB for files the README itself says run 30-50 KB. Each BLE block now goes
+  straight onto the link through `o2ring_ble_download_file_stream()`, which was
+  already written and had never been called. The allocation and the ceiling are
+  both gone. A link that stops accepting frames now also stops the BLE read,
+  rather than pulling the rest of a file nobody is reading.
 - **UART receive reads in blocks instead of one byte per driver call.** The old
   loop called `uart_read_bytes` per byte — ~11k calls/second at the old baud,
   and ~92k at the new one. A line assembler now buffers across calls, which is
