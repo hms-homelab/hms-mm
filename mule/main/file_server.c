@@ -83,6 +83,25 @@ static esp_err_t send_proxy_req(int req_id, const char *path,
     return err;
 }
 
+/* Acknowledge a chunk, releasing the miner to send the next one.
+ *
+ * Sent only AFTER the chunk has been decoded, verified and handed to the HTTP
+ * client, so it paces the miner to what this board can actually absorb rather
+ * than to what the wire can carry. That distinction is the whole point: the
+ * link has no hardware flow control, and a miner streaming faster than the
+ * mule consumes simply loses bytes. */
+static void send_chunk_ack(int req_id, int seq)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+    cJSON_AddStringToObject(root, "type", "chunk_ack");
+    cJSON_AddNumberToObject(root, "id", req_id);
+    cJSON_AddNumberToObject(root, "seq", seq);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
+
 /* Tell the miner to stop streaming this req_id (HTTP client gone), then drain its
  * leftover chunks so the next request starts on a clean UART. Called while still
  * holding the link lock. The miner stops within a chunk or two of the abort; we
@@ -385,6 +404,10 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
             }
             expected_seq++;
             bytes_written += decoded_len;
+
+            /* Released only now, with the bytes already on their way to the
+             * client. The miner blocks until this arrives. */
+            if (!is_last) send_chunk_ack(req_id, expected_seq - 1);
 
             if (is_last) {
                 /* The miner says that was the end. Believe it only if the byte

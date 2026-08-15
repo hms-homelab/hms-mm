@@ -151,6 +151,49 @@ static esp_err_t send_proxy_chunk(int req_id, size_t seq, bool is_last,
     return err;
 }
 
+/* Wait for the mule to acknowledge the chunk just sent.
+ *
+ * THIS IS THE FLOW CONTROL. The link has no hardware handshake, so without an
+ * ack the miner streams at wire speed while the mule is still base64-decoding
+ * the previous chunk and pushing it out over WiFi. Bytes then arrive with
+ * nowhere to go and are simply lost, which the chunk CRC catches but cannot
+ * repair. Measured on Unit 6: free-running lost roughly a third of 98 KB
+ * downloads at every baud tried, while the OTA path — which has always waited
+ * for an ack per chunk — moved 1.7 MB over the same wire without a single
+ * failure.
+ *
+ * Returns 0 on ack, -1 if the mule aborted the stream, -2 on timeout.
+ */
+static int wait_chunk_ack(int req_id)
+{
+    static char buf[512];
+    int64_t deadline = esp_timer_get_time() + (int64_t)PROXY_CHUNK_ACK_TIMEOUT_MS * 1000;
+
+    while (esp_timer_get_time() < deadline) {
+        int len = uart_receive_json(buf, sizeof(buf), 200);
+        if (len <= 0) continue;
+
+        cJSON *msg = cJSON_Parse(buf);
+        if (!msg) continue;
+
+        cJSON *type = cJSON_GetObjectItem(msg, "type");
+        int rc = -3;                       /* -3 = not for us, keep waiting */
+        if (cJSON_IsString(type)) {
+            if (strcmp(type->valuestring, "chunk_ack") == 0) {
+                cJSON *id = cJSON_GetObjectItem(msg, "id");
+                if (!id || id->valueint == req_id) rc = 0;
+            } else if (strcmp(type->valuestring, "proxy_abort") == 0) {
+                /* The client went away. Arrives here instead of an ack, which
+                 * is why the abort check no longer needs its own peek. */
+                rc = -1;
+            }
+        }
+        cJSON_Delete(msg);
+        if (rc != -3) return rc;
+    }
+    return -2;
+}
+
 /* ── Chunk callback — sends meta + chunks over UART ────────────── */
 
 static esp_err_t proxy_chunk_callback(const uint8_t *data, size_t len,
@@ -185,6 +228,22 @@ static esp_err_t proxy_chunk_callback(const uint8_t *data, size_t len,
     if (err != ESP_OK) {
         pctx->error = true;
         return err;
+    }
+
+    /* Nothing to wait for after the final chunk: the mule finalises the
+     * response rather than asking for more. */
+    if (!is_last) {
+        int a = wait_chunk_ack(pctx->req_id);
+        if (a == -1) {
+            ESP_LOGW(TAG, "stream aborted by mule at chunk %zu", seq);
+            pctx->aborted = true;
+            return ESP_FAIL;
+        }
+        if (a == -2) {
+            ESP_LOGE(TAG, "no ack for chunk %zu — mule stopped consuming", seq);
+            pctx->error = true;
+            return ESP_FAIL;
+        }
     }
 
     ESP_LOGD(TAG, "chunk %zu sent (%zu bytes, last=%d)", seq, len, (int)is_last);

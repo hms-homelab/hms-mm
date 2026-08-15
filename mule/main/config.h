@@ -81,6 +81,11 @@
 // Proxy configuration
 #define PROXY_CHUNK_SIZE            4096
 #define PROXY_UART_BUF_SIZE         8192
+// How long the miner waits for the mule to acknowledge a chunk before giving
+// up on the transfer. Generous: the mule may be blocked pushing the previous
+// chunk to a slow HTTP client, which is exactly the condition this ack exists
+// to absorb.
+#define PROXY_CHUNK_ACK_TIMEOUT_MS  10000
 #define PROXY_REQ_TIMEOUT_MS        30000   // per-frame UART recv timeout AND no-progress
                                             // stall window (held mutex). Generous so a
                                             // slow/flaky ezShare card does not 504 mid-

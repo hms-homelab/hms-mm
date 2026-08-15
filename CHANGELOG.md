@@ -32,6 +32,29 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Fixed
 
+- **The link corrupted bulk transfers, and now it does not.** The miner streamed
+  chunks at wire speed while the mule was still decoding the previous one and
+  pushing it out over WiFi; with no hardware handshake on a two-wire link, the
+  excess was simply lost. Each chunk is now acknowledged after the mule has
+  handed it to the HTTP client, so the miner is paced by what the mule can
+  absorb rather than by what the wire can carry.
+  Measured on hardware, downloading the same 98 KB file from an ezShare card:
+
+  | | completed | link errors |
+  |---|---|---|
+  | free-running, 921600 | 0/6 | constant CRC mismatches |
+  | free-running, 460800 | 7/10 | CRC mismatches |
+  | free-running, 230400 | 5/10 | CRC mismatches |
+  | **acknowledged, 460800** | **19/20** | **zero CRC mismatches, zero seq gaps** |
+
+  It is also *faster* than free-running (12.4 KB/s average), because a corrupt
+  transfer has to be thrown away entirely. Lowering the baud never helped,
+  which is what pointed at flow control rather than speed; the OTA path had
+  always worked this way and had never lost a byte, including a 1.7 MB miner
+  image over the same wire.
+  The single remaining failure in 20 was a stall, not corruption: the ezShare
+  card pausing longer than the timeout. That is a property of the card, and it
+  now surfaces as a failed transfer rather than a short file.
 - **Removed the async HTTP worker pool.** Added in 2026.0.5 and never hardware
   tested; the upstream project it was ported from deleted the same pattern five
   days later because it crash-looped the C3 (~10 KB free heap, versus ~55 KB
