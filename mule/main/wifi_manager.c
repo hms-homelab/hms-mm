@@ -27,6 +27,13 @@ static bool s_started = false;
 static bool s_ever_connected = false;
 static int  s_last_disc_reason = 0;
 
+/* Sticky across a whole join attempt. The driver cycles through several reason
+ * codes while failing (202, then 205, then 2 ...), so the LAST one is close to
+ * a coin toss: classifying on it alone made the retry budget flip between the
+ * patient and the impatient limit from boot to boot. If the AP rejected our
+ * credentials even once, that is the fact worth keeping. */
+static bool s_saw_auth_failure = false;
+
 static uint32_t s_backoff_ms = 0;
 static esp_timer_handle_t s_retry_timer = NULL;
 
@@ -113,6 +120,12 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
         if (d) s_last_disc_reason = d->reason;
+        switch (s_last_disc_reason) {
+            case 2: case 15: case 202: case 203: case 204:
+                s_saw_auth_failure = true;
+                break;
+            default: break;
+        }
         log_disconnect(s_last_disc_reason);
 
         if (!s_ever_connected && s_retry < WIFI_MAXIMUM_RETRY) {
@@ -189,6 +202,7 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
     xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     s_retry = 0;
     s_backoff_ms = 0;
+    s_saw_auth_failure = false;          /* per attempt, not per boot */
     esp_err_t rc = esp_wifi_start();
     if (rc == ESP_ERR_WIFI_NOT_STOPPED || s_started) {
         /* Already running. esp_wifi_start() is then a no-op and STA_START
@@ -201,12 +215,30 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
         s_started = true;
     }
 
+    /* ~11 dBm. The C3 SuperMini's PCB antenna cannot take the default ~20 dBm:
+     * driven that hard the output distorts, and the symptom is not "weak" but
+     * "unintelligible" — the chip hears everything and nothing can decode what
+     * it sends. In STA that looks like reaching auth and then AUTH_EXPIRE; in
+     * AP mode it looks like beacons that no device on the bench can see. */
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+
     EventBits_t bits = xEventGroupWaitBits(s_event_group,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                             pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
 
     if (bits & WIFI_CONNECTED_BIT) return ESP_OK;
     return ESP_FAIL;
+}
+
+int wifi_manager_last_disc_reason(void) { return s_last_disc_reason; }
+
+bool wifi_manager_last_failure_was_auth(void)
+{
+    /* True if ANY attempt in this join was rejected on credentials. A run of
+     * failures that never once produced an auth code (201 NO_AP_FOUND and
+     * friends) means the network simply is not there, which a power cut
+     * explains as well as a typo, so those stay patient. */
+    return s_saw_auth_failure;
 }
 
 esp_err_t wifi_manager_disconnect(void)

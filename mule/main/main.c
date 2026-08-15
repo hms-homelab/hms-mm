@@ -25,6 +25,7 @@
 #include "log_ring.h"
 #include "ota_service.h"
 #include "crash_guard.h"
+#include "miner_link.h"
 #include "mule_task.h"
 #include "config.h"
 
@@ -42,6 +43,27 @@ void app_main(void)
      * could itself crash. */
     crash_guard_init();
     uart_handler_init();
+
+    /* Probe the link before touching WiFi. The miner version was previously
+     * only read once the network was up, so a unit that could not join told
+     * you nothing about whether the two boards were even wired to each other,
+     * and a link fault looked identical to a WiFi fault. This separates them:
+     * by the next line you know whether the miner is there. */
+    char mver[32] = {0};
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (miner_link_query_version(mver, sizeof(mver))) {
+            ESP_LOGI(TAG, "Link OK: miner firmware %s", mver);
+            break;
+        }
+        if (attempt < 3) {
+            ESP_LOGW(TAG, "No answer from the miner (%d/3), retrying", attempt);
+            vTaskDelay(pdMS_TO_TICKS(1500));   /* it may still be booting */
+        } else {
+            ESP_LOGE(TAG, "Link DOWN: the miner did not answer. Check the "
+                          "TX/RX crossover (mule GPIO%d/%d) and a common ground.",
+                     UART_TX_PIN, UART_RX_PIN);
+        }
+    }
 
     char ssid[33] = {0}, pass[65] = {0};
     bool wifi_ok = false;
@@ -61,14 +83,25 @@ void app_main(void)
              * conclude the credentials are wrong once it has failed
              * persistently. */
             uint32_t fails = nvs_config_wifi_fail_bump();
-            if (fails < WIFI_FAIL_THRESHOLD) {
-                ESP_LOGW(TAG, "WiFi join failed (%lu/%d) — keeping credentials, retrying",
-                         (unsigned long)fails, WIFI_FAIL_THRESHOLD);
-                vTaskDelay(pdMS_TO_TICKS(5000));
+
+            /* How long to persist depends on WHY it failed. The device already
+             * knows: an absent network (a router still booting) deserves
+             * patience, while credentials the AP actively rejects will never
+             * start working on their own, and making someone wait five minutes
+             * to retype a password is its own kind of broken. */
+            bool auth = wifi_manager_last_failure_was_auth();
+            uint32_t limit = auth ? WIFI_AUTH_FAIL_THRESHOLD : WIFI_FAIL_THRESHOLD;
+
+            if (fails < limit) {
+                ESP_LOGW(TAG, "WiFi join failed (%lu/%lu, reason=%d%s) — keeping credentials, retrying",
+                         (unsigned long)fails, (unsigned long)limit,
+                         wifi_manager_last_disc_reason(),
+                         auth ? ", looks like bad credentials" : "");
+                vTaskDelay(pdMS_TO_TICKS(auth ? 1000 : 5000));
                 esp_restart();
             }
-            ESP_LOGE(TAG, "WiFi join failed %lu times — clearing credentials for setup",
-                     (unsigned long)fails);
+            ESP_LOGE(TAG, "WiFi join failed %lu times (reason=%d) — clearing credentials for setup",
+                     (unsigned long)fails, wifi_manager_last_disc_reason());
             nvs_config_clear_wifi();
             captive_portal_start();
             return;

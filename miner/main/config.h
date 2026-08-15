@@ -16,6 +16,11 @@
 // ezShare WiFi defaults (overridden by NVS if captive portal was used)
 #define EZSHARE_WIFI_SSID_DEFAULT   "ez Share"
 #define EZSHARE_WIFI_PASSWORD_DEFAULT "88888888"
+// Max radio transmit power, in quarter-dBm. 44 = 11 dBm. NOT a power saving:
+// the C3 SuperMini PCB antenna distorts at the ~20 dBm default, so turning it
+// down makes the device INTELLIGIBLE, not quieter.
+#define WIFI_TX_POWER_QDBM          44
+
 #define WIFI_MAXIMUM_RETRY          5
 #define WIFI_CONNECT_TIMEOUT_MS     10000
 // Reconnect ladder, used only AFTER a first successful association. The
@@ -38,7 +43,7 @@
 #define UART_PORT_NUM               UART_NUM_1
 // Must match the mule exactly — see the note in mule/main/config.h. Changing
 // the baud is a breaking link change: flash both boards together.
-#define UART_BAUD_RATE              921600
+#define UART_BAUD_RATE              460800
 #define UART_TX_PIN                 GPIO_NUM_2
 #define UART_RX_PIN                 GPIO_NUM_3
 #define UART_RX_BUFFER_SIZE         16384

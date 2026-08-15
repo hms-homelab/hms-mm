@@ -170,7 +170,24 @@ static bool parse_field(char *body, const char *name, char *out, size_t out_size
 
 static esp_err_t handle_root(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, PORTAL_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, PORTAL_HTML, HTTPD_RESP_USE_STRLEN);
+
+    /* If we are back here because a saved network was rejected, say so. The
+     * page previously reappeared blank and identical whether this was a first
+     * setup or the third failed attempt, which leaves the user guessing at
+     * whether they even typed it wrong. */
+    uint32_t fails = nvs_config_wifi_fail_count();
+    if (fails > 0) {
+        char note[240];
+        snprintf(note, sizeof(note),
+                 "<script>document.getElementById('st').style.color='#F87171';"
+                 "document.getElementById('st').textContent="
+                 "'The last network was not accepted after %lu attempt%s. "
+                 "Check the password and that it is a 2.4 GHz network.';</script>",
+                 (unsigned long)fails, fails == 1 ? "" : "s");
+        httpd_resp_send_chunk(req, note, HTTPD_RESP_USE_STRLEN);
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static esp_err_t handle_redirect(httpd_req_t *req) {
@@ -279,9 +296,31 @@ void captive_portal_start(void)
     ap_config.ap.authmode = WIFI_AUTH_OPEN;
     ap_config.ap.max_connection = PORTAL_MAX_CONN;
 
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    esp_wifi_start();
+    /* APSTA, not AP: /scan drives esp_wifi_scan_start to populate the network
+     * dropdown, and scanning needs the station interface. */
+    esp_err_t e;
+    if ((e = esp_wifi_set_mode(WIFI_MODE_APSTA)) != ESP_OK)
+        ESP_LOGE(TAG, "set_mode: %s", esp_err_to_name(e));
+    if ((e = esp_wifi_set_config(WIFI_IF_AP, &ap_config)) != ESP_OK)
+        ESP_LOGE(TAG, "set_config: %s", esp_err_to_name(e));
+    if ((e = esp_wifi_start()) != ESP_OK)
+        ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(e));
+
+    /* ~11 dBm. The C3 SuperMini's PCB antenna cannot take the default ~20 dBm:
+     * driven that hard the output distorts, and the symptom is not "weak" but
+     * "unintelligible" — the chip hears everything and nothing can decode what
+     * it sends. In STA that looks like reaching auth and then AUTH_EXPIRE; in
+     * AP mode it looks like beacons that no device on the bench can see. */
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+
+    /* Read back what the driver actually holds. Every call above used to be
+     * unchecked, so a rejected config produced a device that logged "portal
+     * started" while nothing was on the air. */
+    wifi_config_t got = {0};
+    if (esp_wifi_get_config(WIFI_IF_AP, &got) == ESP_OK)
+        ESP_LOGI(TAG, "AP live: ssid='%s' len=%d ch=%d auth=%d max_conn=%d hidden=%d",
+                 (char *)got.ap.ssid, got.ap.ssid_len, got.ap.channel,
+                 got.ap.authmode, got.ap.max_connection, got.ap.ssid_hidden);
 
     xTaskCreate(dns_server_task, "dns_hijack", 4096, NULL, 5, &s_dns_task);
 

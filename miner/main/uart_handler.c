@@ -283,8 +283,16 @@ int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms)
         if (got >= 0) return got;
     } while ((xTaskGetTickCount() - start) <= timeout);
 
-    ESP_LOGW(TAG, "UART receive timeout (%u B buffered, no frame terminator)",
-             (unsigned)s_accum_len);
+    /* An idle poll expiring is the normal state of this link, not a fault: the
+     * miner polls once a second and the mule only speaks when it has something
+     * to say. Warning here emitted a line every 1.1 s forever, which floods the
+     * console and pushes everything worth reading out of the log ring. Only a
+     * STRANDED PARTIAL FRAME is worth a warning. */
+    if (s_accum_len > 0)
+        ESP_LOGW(TAG, "UART receive timeout with %u B of an incomplete frame buffered",
+                 (unsigned)s_accum_len);
+    else
+        ESP_LOGD(TAG, "UART receive timeout (idle)");
     return -1;
 }
 

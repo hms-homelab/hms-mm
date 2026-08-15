@@ -133,6 +133,14 @@ uint32_t nvs_config_wifi_fail_bump(void)
     return n;
 }
 
+uint32_t nvs_config_wifi_fail_count(void)
+{
+    if (!s_nvs) return 0;
+    uint32_t n = 0;
+    nvs_get_u32(s_nvs, "wifi_fails", &n);
+    return n;
+}
+
 void nvs_config_wifi_fail_clear(void)
 {
     if (!s_nvs) return;

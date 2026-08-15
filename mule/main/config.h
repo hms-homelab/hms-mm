@@ -12,6 +12,11 @@
 // Home WiFi defaults (overridden by NVS if captive portal was used)
 #define HOME_WIFI_SSID_DEFAULT      "your_wifi_ssid"
 #define HOME_WIFI_PASSWORD_DEFAULT  "your_wifi_password"
+// Max radio transmit power, in quarter-dBm. 44 = 11 dBm. NOT a power saving:
+// the C3 SuperMini PCB antenna distorts at the ~20 dBm default, so turning it
+// down makes the device INTELLIGIBLE, not quieter.
+#define WIFI_TX_POWER_QDBM          44
+
 #define WIFI_MAXIMUM_RETRY          5
 #define WIFI_CONNECT_TIMEOUT_MS     15000
 // Reconnect ladder, used only AFTER a first successful join. A drop then means
@@ -28,20 +33,39 @@
 // a router that is slow to come back after a power cut must not cost the user
 // a re-provision, and each attempt is only a few seconds plus a reboot.
 #define WIFI_FAIL_THRESHOLD         15
+// Shorter budget when the failure looks like bad credentials. A typo should
+// hand the setup page back in about a minute, not five. Not 1, because a
+// marginal link produces the same reason codes with a correct password.
+#define WIFI_AUTH_FAIL_THRESHOLD    4
 
 // UART: TX=GPIO2, RX=GPIO3. Both boards use identical pins; the 3D-printed
 // tape board does the TX->RX crossover via the 180-deg module layout.
 // GPIO2 is a strapping pin but is always TX (idles high), so it stays boot-safe.
 #define UART_PORT_NUM               UART_NUM_1
-// 921600 over a few cm of copper tape. There is no hardware flow control — the
-// tape board carries only TX/RX/GND/3V3 — so the RX ring is what absorbs a
-// reader that falls behind; 16 KB is ~178 ms of slack at this rate. If a rig
-// ever shows framing errors, this is the one knob to dial back (460800, then
-// 230400); both boards must be reflashed together when it changes.
-#define UART_BAUD_RATE              921600
+// MEASURED ON HARDWARE (Unit 6, 2026-08-15), not chosen on theory.
+//
+// There is no hardware flow control: the link is two wires. Chunk CRCs catch
+// corrupted frames, and on the bench a full 98 KB download from an ezShare card
+// completed:
+//     921600  -> 0/6    (constant CRC mismatches)
+//     460800  -> 7/10
+//     230400  -> 5/10
+// Lowering the baud does NOT monotonically improve it, so raw speed is not the
+// variable and dialling further down is chasing the wrong thing. The remaining
+// corruption is almost certainly RX starvation while the mule is busy on WiFi,
+// which a slower wire does not fix. The real fix is per-chunk acknowledgement
+// on the proxy path so the miner never sends faster than the mule consumes —
+// the OTA path already works that way. Until that lands, 460800 is simply the
+// best-measured setting, and the CRC is what stops corruption reaching a file.
+#define UART_BAUD_RATE              460800
 #define UART_TX_PIN                 GPIO_NUM_2
 #define UART_RX_PIN                 GPIO_NUM_3
-#define UART_RX_BUFFER_SIZE         16384
+// 32 KB, deliberately larger than the miner's. This is the direction the bulk
+// data flows, and the httpd task must base64-decode, CRC and push each chunk
+// over WiFi before it reads again — so any WiFi stall has to be absorbed here.
+// With no hardware flow control on a two-wire link, ring depth IS the flow
+// control. At 460800 this is ~700 ms of slack.
+#define UART_RX_BUFFER_SIZE         32768
 #define UART_TX_BUFFER_SIZE         8192
 #define UART_QUEUE_SIZE             20
 // Longest single newline-delimited frame. A proxy_chunk is PROXY_CHUNK_SIZE

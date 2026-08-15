@@ -116,6 +116,15 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
 {
     esp_err_t ret = ESP_FAIL;
     bool chunked_started = false;
+    /* Declared here, above the first `goto cleanup`: jumping over an
+     * initialiser leaves the variable indeterminate, and cleanup reads these. */
+    bool     meta_seen = false;
+    uint32_t content_len = 0;
+    uint32_t bytes_written = 0;
+    /* Set on any mid-stream failure. The cleanup path then returns without
+     * sending the terminating chunk, so the client sees a broken transfer
+     * instead of a short file that looks whole. */
+    bool     abandon_stream = false;
 
     /* Fast-fail, not a long block: handlers run on the single httpd task, so
      * waiting out someone else's download here would stall every other route
@@ -160,7 +169,12 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                 httpd_resp_set_status(req, "504 Gateway Timeout");
                 httpd_resp_send(req, "Miner stalled", HTTPD_RESP_USE_STRLEN);
             } else {
-                httpd_resp_send_chunk(req, NULL, 0);
+                /* Do NOT terminate the stream. The 200 is already sent, so
+                 * abandoning the connection mid-chunk is the only signal left
+                 * that this is not a whole file. Closing it politely would
+                 * hand the client a truncated recording it believes is
+                 * complete. */
+                abandon_stream = true;
             }
             ret = ESP_ERR_TIMEOUT;
             goto cleanup;
@@ -172,7 +186,12 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                 httpd_resp_set_status(req, "504 Gateway Timeout");
                 httpd_resp_send(req, "Miner timeout", HTTPD_RESP_USE_STRLEN);
             } else {
-                httpd_resp_send_chunk(req, NULL, 0);
+                /* Do NOT terminate the stream. The 200 is already sent, so
+                 * abandoning the connection mid-chunk is the only signal left
+                 * that this is not a whole file. Closing it politely would
+                 * hand the client a truncated recording it believes is
+                 * complete. */
+                abandon_stream = true;
             }
             ret = ESP_ERR_TIMEOUT;
             goto cleanup;
@@ -186,7 +205,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                     httpd_resp_set_status(req, "502 Bad Gateway");
                     httpd_resp_send(req, "Protocol error", HTTPD_RESP_USE_STRLEN);
                 } else {
-                    httpd_resp_send_chunk(req, NULL, 0);
+                    abandon_stream = true;   /* see above: never finalise a partial stream */
                 }
                 ret = ESP_FAIL;
                 goto cleanup;
@@ -224,7 +243,12 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                 httpd_resp_send(req, em ? em->valuestring : "Miner error",
                                 HTTPD_RESP_USE_STRLEN);
             } else {
-                httpd_resp_send_chunk(req, NULL, 0);
+                /* Do NOT terminate the stream. The 200 is already sent, so
+                 * abandoning the connection mid-chunk is the only signal left
+                 * that this is not a whole file. Closing it politely would
+                 * hand the client a truncated recording it believes is
+                 * complete. */
+                abandon_stream = true;
             }
             cJSON_Delete(msg);
             ret = ESP_FAIL;
@@ -244,9 +268,19 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
             uint32_t total_size = ts_j ? (uint32_t)ts_j->valueint : 0;
             uint32_t cl = cl_j ? (uint32_t)cl_j->valueint : 0;
 
+            content_len = cl;
+            meta_seen = true;
+            ESP_LOGI(TAG, "META req_id=%d: status=%d content_len=%lu total=%lu",
+                     req_id, http_status, (unsigned long)cl, (unsigned long)total_size);
+
             if (http_status == 206) {
                 httpd_resp_set_status(req, "206 Partial Content");
-                char cr_hdr[64];
+                /* static, NOT stack: httpd_resp_set_hdr stores the POINTER and
+                 * does not copy, and the headers are not written until the
+                 * first chunk goes out — long after a local would have left
+                 * scope. That is why Content-Range arrived empty. Safe as a
+                 * static because the link lock serialises these handlers. */
+                static char cr_hdr[64];
                 uint32_t end_byte = range_end > 0 ? range_end
                     : (range_start + cl - 1);
                 if (total_size > 0)
@@ -287,7 +321,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                     httpd_resp_set_status(req, "502 Bad Gateway");
                     httpd_resp_send(req, "Lost a chunk from the miner", HTTPD_RESP_USE_STRLEN);
                 } else {
-                    httpd_resp_send_chunk(req, NULL, 0);
+                    abandon_stream = true;   /* see above: never finalise a partial stream */
                 }
                 ret = ESP_FAIL;
                 goto cleanup;
@@ -312,7 +346,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                     httpd_resp_set_status(req, "502 Bad Gateway");
                     httpd_resp_send(req, "Decode error", HTTPD_RESP_USE_STRLEN);
                 } else {
-                    httpd_resp_send_chunk(req, NULL, 0);
+                    abandon_stream = true;   /* see above: never finalise a partial stream */
                 }
                 ret = ESP_FAIL;
                 goto cleanup;
@@ -331,7 +365,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                         httpd_resp_set_status(req, "502 Bad Gateway");
                         httpd_resp_send(req, "Corrupt chunk from the miner", HTTPD_RESP_USE_STRLEN);
                     } else {
-                        httpd_resp_send_chunk(req, NULL, 0);
+                        abandon_stream = true;   /* never finalise a corrupt stream */
                     }
                     ret = ESP_FAIL;
                     goto cleanup;
@@ -350,10 +384,23 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                 goto cleanup;
             }
             expected_seq++;
+            bytes_written += decoded_len;
 
             if (is_last) {
+                /* The miner says that was the end. Believe it only if the byte
+                 * count matches what the card promised. */
+                if (meta_seen && content_len > 0 && bytes_written != content_len) {
+                    ESP_LOGE(TAG, "INCOMPLETE req_id=%d: %lu of %lu bytes — "
+                                  "failing the response rather than finalising it",
+                             req_id, (unsigned long)bytes_written,
+                             (unsigned long)content_len);
+                    abandon_stream = true;
+                    ret = ESP_FAIL;
+                    goto cleanup;
+                }
                 httpd_resp_send_chunk(req, NULL, 0);
-                ESP_LOGI(TAG, "Proxy complete req_id=%d", req_id);
+                ESP_LOGI(TAG, "Proxy complete req_id=%d: %lu bytes",
+                         req_id, (unsigned long)bytes_written);
                 ret = ESP_OK;
                 goto cleanup;
             }
@@ -364,6 +411,17 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     }
 
 cleanup:
+    if (abandon_stream) {
+        /* Returning non-OK makes esp_http_server drop the connection without
+         * writing the zero-length terminator, so the client's HTTP layer
+         * reports a truncated transfer. curl gives exit 18; a browser reports
+         * a failed download. That is the whole point: a short recording must
+         * not arrive looking complete. */
+        ESP_LOGE(TAG, "ABANDONING req_id=%d after %lu bytes so the client sees a failure",
+                 req_id, (unsigned long)bytes_written);
+        if (ret == ESP_OK) ret = ESP_FAIL;
+    }
+
     /* If a stream was in progress but didn't finish cleanly (client disconnect,
      * timeout, or error — ret is only ESP_OK on the is_last success path), the
      * miner may still be pushing chunks for this req_id. Tell it to stop and drain
@@ -512,6 +570,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
         static char uart_buf[PROXY_UART_BUF_SIZE];
         static uint8_t decode_buf[PROXY_CHUNK_SIZE];
         bool chunked_started = false;
+        bool abandon_stream = false;   /* never finalise a partial .vld */
         int expected_seq = 0;
 
         while (true) {
@@ -521,7 +580,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
                     httpd_resp_set_status(req, "504 Gateway Timeout");
                     httpd_resp_send(req, "O2Ring download timeout", HTTPD_RESP_USE_STRLEN);
                 } else {
-                    httpd_resp_send_chunk(req, NULL, 0);
+                    abandon_stream = true;   /* see above: never finalise a partial stream */
                 }
                 break;
             }
@@ -541,7 +600,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
                     httpd_resp_set_status(req, "502 Bad Gateway");
                     httpd_resp_send(req, em ? em->valuestring : "Download error", HTTPD_RESP_USE_STRLEN);
                 } else {
-                    httpd_resp_send_chunk(req, NULL, 0);
+                    abandon_stream = true;   /* see above: never finalise a partial stream */
                 }
                 cJSON_Delete(msg);
                 break;
@@ -585,7 +644,9 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
                     ESP_LOGE(TAG, "O2Ring download req_id=%d aborted: %s (seq=%d)",
                              req_id, bad, expected_seq);
                     if (chunked_started) {
-                        httpd_resp_send_chunk(req, NULL, 0);   /* truncate, don't pretend */
+                        /* Abandon rather than terminate: a clean end here would
+                         * present a partial .vld as a complete one. */
+                        abandon_stream = true;
                     } else {
                         httpd_resp_set_status(req, "502 Bad Gateway");
                         httpd_resp_send(req, bad, HTTPD_RESP_USE_STRLEN);
@@ -600,6 +661,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
 
                 if (httpd_resp_send_chunk(req, (const char *)decode_buf, decoded_len) != ESP_OK) {
                     ESP_LOGW(TAG, "HTTP client disconnected during O2Ring download");
+                    abandon_stream = true;
                     break;
                 }
                 expected_seq++;
@@ -611,6 +673,16 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
                 continue;
             }
             cJSON_Delete(msg);
+        }
+
+        if (abandon_stream) {
+            /* Same rule as the ezShare path: leave the chunked response
+             * unterminated so the client's HTTP layer reports a truncated
+             * download rather than accepting a partial .vld as whole. */
+            ESP_LOGE(TAG, "ABANDONING O2Ring download req_id=%d so the client sees a failure",
+                     req_id);
+            uart_link_unlock();
+            return ESP_FAIL;
         }
     } else {
         /* List mode */

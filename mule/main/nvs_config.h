@@ -27,6 +27,7 @@ void nvs_config_set_serial(const char *serial);
 // Consecutive boots where the stored WiFi could not be joined. Cleared on any
 // successful join. Used to decide when credentials are the problem.
 uint32_t nvs_config_wifi_fail_bump(void);
+uint32_t nvs_config_wifi_fail_count(void);
 void nvs_config_wifi_fail_clear(void);
 
 // Forget the home WiFi so the next boot lands on the captive portal. ezShare

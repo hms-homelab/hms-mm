@@ -271,6 +271,13 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
         return ret;
     }
 
+    /* ~11 dBm. The C3 SuperMini's PCB antenna cannot take the default ~20 dBm:
+     * driven that hard the output distorts, and the symptom is not "weak" but
+     * "unintelligible" — the chip hears everything and nothing can decode what
+     * it sends. In STA that looks like reaching auth and then AUTH_EXPIRE; in
+     * AP mode it looks like beacons that no device on the bench can see. */
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+
     // Wait for connection or failure
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
