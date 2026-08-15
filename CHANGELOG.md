@@ -5,7 +5,7 @@ independently — a release often touches one board and not the other, and eithe
 can be updated without the other, so in the field they legitimately differ.
 `/api/status` reports both (`fw` and `miner_fw`).
 
-## [Unreleased]
+## [2026.1.1] - 2026-08-15
 
 ### Breaking — flash both boards together
 
