@@ -254,133 +254,28 @@ WiFi and BLE share the ESP32-C3 radio, so they run sequentially — the miner di
 
 ## UART Protocol
 
-Newline-delimited JSON — one frame per line, so the link stays readable in a
-serial monitor. Both boards must run the same baud (`UART_BAUD_RATE`), so
-changing it means reflashing the pair.
+Newline-delimited JSON, one frame per line, so the link stays readable in a
+serial monitor. Both boards must run the same baud (`UART_BAUD_RATE`).
 
-### Mule -> Miner
-
-**Proxy request:**
-```json
-{"type":"proxy_req","id":1,"path":"/dir?dir=A:DATALOG","rs":0,"re":0}
-```
-- `id` — request ID for matching responses
-- `path` — ezShare URL path
-- `rs`/`re` — Range start/end (0 = no range)
-
-**Set config (at boot):**
-```json
-{"type":"set_config","ez_ssid":"ez Share","ez_pass":"88888888"}
-```
-
-**Chunk acknowledgement (mule -> miner):**
-```json
-{"type":"chunk_ack","id":1,"seq":0}
-```
-Sent after each non-final `proxy_chunk` has been consumed. The miner waits for
-it before sending the next chunk, and gives up after
-`PROXY_CHUNK_ACK_TIMEOUT_MS`. No ack is sent for the final chunk. A
-`proxy_abort` in its place means the client disconnected.
-
-### Miner -> Mule
-
-**Proxy metadata (sent before first chunk):**
-```json
-{"type":"proxy_meta","id":1,"st":200,"cl":1528,"ts":0}
-```
-- `st` — HTTP status from ezShare (200 or 206)
-- `cl` — content length
-- `ts` — total file size (for Range responses)
-
-**Proxy chunk (streamed, base64-encoded):**
-```json
-{"type":"proxy_chunk","id":1,"seq":0,"c":2276608578,"d":"<base64>","last":false}
-```
-- `seq` — chunk sequence number. A gap aborts the transfer; the mule will not
-  hand the client a response with a hole in it.
-- `c` — CRC32 of the **decoded** bytes. The link has no parity, checksum or
-  hardware flow control, and base64 will happily decode a frame that lost bytes
-  into shorter, well-formed garbage — so a successful decode proves nothing and
-  this is what actually catches corruption. Sent as a JSON number; read it as a
-  double, since a CRC above 2^31 will not fit a 32-bit signed int.
-- `d` — base64-encoded binary data
-- `last` — true on final chunk
-
-
-**Error:**
-```json
-{"type":"error","id":1,"message":"ezShare unreachable","code":"WIFI_FAILED",
- "assoc":false,"rssi":0,"reason":201}
-```
-Every error carries the miner's view of the ezShare link, because otherwise all
-failures look like an identical `502` from the mule's side:
-
-| Diagnostic | Meaning |
-|---|---|
-| `assoc:false, reason:201` | AP not found — card off, asleep, or out of range |
-| `assoc:false, reason:202` | Authentication failed — wrong card password |
-| `assoc:true, rssi<=-80` | Associated but too weak to move data |
-
-The mule keeps the latest of these and reports it under `ezshare` in
-`/api/status`.
-
-**Config acknowledgment:**
-```json
-{"type":"config_ack","status":"ok","changed":true}
-```
-`changed` tells the mule whether the miner is about to restart to apply new
-credentials. Identical credentials are acknowledged without a restart, so a
-mule reboot no longer drags the miner down with it.
-
-### Control messages
-
-Small request/response exchanges, all mule -> miner unless noted.
-
-| Send | Reply | Purpose |
+| Message | Direction | Purpose |
 |---|---|---|
-| `{"type":"version_req"}` | `{"type":"version_resp","ver":"2026.0.6"}` | Miner firmware version; surfaces as `miner_fw` in `/api/status` |
-| `{"type":"reboot"}` | `{"type":"ack","of":"reboot"}` | Restart the miner, **config intact** |
-| `{"type":"reset"}` | `{"type":"ack","of":"reset"}` | Erase miner config and restart; the mule re-pushes credentials on its next boot |
-| `{"type":"o2_state_req"}` | `{"type":"o2_state_resp","enabled":false}` | Read the O2Ring BLE gate |
-| `{"type":"o2_set_enabled","enabled":true}` | `{"type":"o2_state_resp","enabled":true}` | Set the gate. The miner restarts to apply it, since the BLE stack is only brought up at init. A no-op change does not restart. |
+| `proxy_req` | mule -> miner | Fetch an ezShare path. Carries `id`, `path`, and `rs`/`re` for Range |
+| `proxy_meta` | miner -> mule | HTTP status and length, once, before the chunks |
+| `proxy_chunk` | miner -> mule | Base64 data with `seq`, a CRC32 `c` of the decoded bytes, and `last` |
+| `chunk_ack` | mule -> miner | Releases the miner to send the next chunk |
+| `proxy_abort` | mule -> miner | Client disconnected; stop streaming |
+| `error` | miner -> mule | Failure, plus `assoc`/`rssi`/`reason` for the ezShare link |
+| `set_config` / `config_ack` | both | Push ezShare credentials; the ack reports whether they changed |
+| `version_req` / `version_resp` | both | Miner firmware version |
+| `reboot` / `reset` / `ack` | mule -> miner | Restart, or erase config and restart |
+| `o2_state_req` / `o2_state_resp` / `o2_set_enabled` | both | Read or set the O2Ring BLE gate |
+| `o2ring_req` | mule -> miner | `status`, `files`, `live` or `download` |
+| `o2ring_status` / `o2ring_files` / `o2ring_live` | miner -> mule | Replies to the above; downloads reuse `proxy_meta` + `proxy_chunk` |
+| `ota_begin` / `ota_chunk` / `ota_finish` | mule -> miner | Firmware image, acknowledged per chunk |
 
-**Firmware update** (mule -> miner), which the mule drives from either an HTTP
-download or a body upload:
-
-```json
-{"type":"ota_begin","total":1714912}
-{"type":"ota_chunk","off":0,"c":2276608578,"d":"<base64>"}
-{"type":"ota_finish"}
-```
-Each frame is acknowledged before the next is sent. `off` is checked against
-the miner's own byte count, so a dropped or duplicated chunk fails the transfer
-instead of quietly writing a misaligned image, and `c` is verified before the
-bytes reach flash. While a transfer is open the miner accepts only `ota_chunk`,
-`ota_finish` and `ota_abort`, and refuses everything else with `OTA_BUSY`.
-
-An `ack` may be lost — the miner can restart before it drains — so a missing
-ack is not proof the command was ignored.
-
-### O2Ring Messages
-
-**O2Ring request (mule -> miner):**
-```json
-{"type":"o2ring_req","id":10,"cmd":"status"}
-{"type":"o2ring_req","id":11,"cmd":"files"}
-{"type":"o2ring_req","id":12,"cmd":"download","name":"20260412065307.vld"}
-{"type":"o2ring_req","id":13,"cmd":"live"}
-```
-- `cmd` — `status`, `files`, `live`, or `download`
-- `name` — filename for download command
-
-**O2Ring responses (miner -> mule):**
-```json
-{"type":"o2ring_status","id":10,"connected":true,"model":"O2Ring","serial":"...","battery":74,"file_count":2}
-{"type":"o2ring_files","id":11,"files":["20260412065307.vld"],"battery":74}
-{"type":"o2ring_live","id":13,"spo2":97,"hr":62,"motion":5,"vibration":0,"valid":true}
-```
-
-File downloads reuse `proxy_meta` + `proxy_chunk` framing (same as ezShare).
+Every frame carries the `id` of the request it belongs to; frames for another
+`id` are ignored. The exact field names are in `mule/main/file_server.c` and
+`miner/main/scanner_task.c`.
 
 ## Credential Priority
 
