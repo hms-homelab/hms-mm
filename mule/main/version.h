@@ -14,12 +14,12 @@
  * version, and requires the pushed tag to match at least one of them.
  */
 
-#define VERSION_YEAR    2026
-#define VERSION_MINOR   1
-#define VERSION_PATCH   1
+#define VERSION_MAJOR   1
+#define VERSION_MINOR   0
+#define VERSION_PATCH   0
 
 #define _STRINGIFY(x) #x
 #define STRINGIFY(x) _STRINGIFY(x)
 
 #define FIRMWARE_VERSION \
-    STRINGIFY(VERSION_YEAR) "." STRINGIFY(VERSION_MINOR) "." STRINGIFY(VERSION_PATCH)
+    STRINGIFY(VERSION_MAJOR) "." STRINGIFY(VERSION_MINOR) "." STRINGIFY(VERSION_PATCH)

@@ -29,7 +29,7 @@ jobs:
         run: |
           read_ver() {
             awk '
-              /#define[ \t]+VERSION_YEAR/  {y=$3}
+              /#define[ \t]+VERSION_MAJOR/ {y=$3}
               /#define[ \t]+VERSION_MINOR/ {m=$3}
               /#define[ \t]+VERSION_PATCH/ {p=$3}
               END {print y "." m "." p}' "$1/main/version.h"
