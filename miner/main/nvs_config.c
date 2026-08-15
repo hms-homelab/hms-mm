@@ -80,3 +80,22 @@ bool nvs_config_ble_active(void)
     uint8_t v = 0;
     return (nvs_get_u8(s_nvs, "ble_active", &v) == ESP_OK) && (v != 0);
 }
+
+void nvs_config_set_ble_active(bool enabled)
+{
+    if (!s_nvs) return;
+    nvs_set_u8(s_nvs, "ble_active", enabled ? 1 : 0);
+    nvs_commit(s_nvs);
+    ESP_LOGI(TAG, "ble_active set to %d (takes effect on reboot)", enabled ? 1 : 0);
+}
+
+void nvs_config_erase_all(void)
+{
+    /* Wipes this namespace only — ezShare creds and the BLE gate. The mule
+     * re-pushes credentials with set_config on its next boot, so a reset unit
+     * comes back configured rather than needing USB. */
+    if (!s_nvs) return;
+    nvs_erase_all(s_nvs);
+    nvs_commit(s_nvs);
+    ESP_LOGW(TAG, "miner NVS erased");
+}

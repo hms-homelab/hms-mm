@@ -57,6 +57,20 @@ can be updated without the other, so in the field they legitimately differ.
   only while `scanner_task` was the sole transmitter. Added ahead of the task
   split, so two interleaved writes can never produce one unparseable line plus
   one lost frame.
+- **A mule reboot no longer restarts the miner.** The mule sends `set_config`
+  on every boot and the miner restarted unconditionally to apply it — so a mule
+  crash-and-recover took the miner down too, potentially mid-transfer. It now
+  restarts only when the credentials actually changed, which is the only case
+  where a restart does anything.
+- **`config_ack` was sent by the miner and read by nobody.** A miner that never
+  received its configuration was indistinguishable from one that did. The mule
+  now waits for it and logs the outcome.
+- **`/api/status` reported fabricated values** — a hardcoded `"mqtt":false`
+  (there is no MQTT client anywhere in this project) and `"o2ring":false`
+  regardless of the real state. Replaced with a real payload: `fw`, `miner_fw`,
+  `wifi`, `uptime`, `free_heap`, `largest_block`, `min_free`, and the `ezshare`
+  diagnostics block. `largest_block` matters more than `free_heap` on a C3,
+  where fragmentation rather than total free is what fails an allocation.
 
 ### Changed
 
@@ -74,6 +88,19 @@ can be updated without the other, so in the field they legitimately differ.
 
 ### Added
 
+- **Control messages on the link**: `version_req`/`version_resp`, `reboot`,
+  `reset`, `o2_state_req`/`o2_state_resp` and `o2_set_enabled`. `reboot` leaves
+  the miner's config alone; `reset` erases it and lets the mule re-push
+  credentials on its next boot. Mule-side exchanges live in `miner_link.c` and
+  hold the link across send-and-reply, so a control request issued while a
+  transfer is running cannot steal its frames.
+- **ezShare diagnostics on every miner error** (`assoc`, `rssi`, `reason`).
+  Previously every failure reached the mule as an undifferentiated `502`;
+  reason 201 (card off/asleep/out of range) and 202 (wrong card password) are
+  entirely different problems and are now distinguishable without a serial
+  cable. Surfaced under `ezshare` in `/api/status`.
+- **The miner now logs its WiFi disconnect reason.** It captured the code and
+  printed none of it, so every cause looked the same in a log.
 - **Release CI** (`.github/workflows/release.yml`). On a `v*` tag: builds both
   boards, publishes app images, bootloaders, partition tables, `*-merged.bin`
   single-file images flashable at `0x0`, and `SHA256SUMS.txt`. Artefacts are

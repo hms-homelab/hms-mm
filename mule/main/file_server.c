@@ -8,10 +8,13 @@
 
 #include "file_server.h"
 #include "uart_handler.h"
+#include "miner_link.h"
 #include "wifi_manager.h"
 #include "config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 #include "esp_rom_crc.h"
 #include "mbedtls/base64.h"
@@ -22,15 +25,15 @@
 #include <stdio.h>
 
 static const char *TAG = "file_srv";
-static SemaphoreHandle_t s_proxy_mutex = NULL;
 static int s_req_id = 0;
 
 #define MAX_PATH 256
 
 void file_server_init(void)
 {
-    if (!s_proxy_mutex)
-        s_proxy_mutex = xSemaphoreCreateMutex();
+    /* The link lock now lives in uart_handler (uart_link_lock), so that the
+     * control endpoints can share it with these proxy handlers rather than
+     * each subsystem guarding the miner with a private mutex of its own. */
 }
 
 /* ── Range header parsing ──────────────────────────────────────── */
@@ -81,7 +84,7 @@ static esp_err_t send_proxy_req(int req_id, const char *path,
 
 /* Tell the miner to stop streaming this req_id (HTTP client gone), then drain its
  * leftover chunks so the next request starts on a clean UART. Called while still
- * holding s_proxy_mutex. The miner stops within a chunk or two of the abort; we
+ * holding the link lock. The miner stops within a chunk or two of the abort; we
  * read and discard whatever was already queued until the link goes idle. */
 static void proxy_send_abort_and_drain(int req_id)
 {
@@ -116,7 +119,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     /* Fast-fail, not a long block: handlers run on the single httpd task, so
      * waiting out someone else's download here would stall every other route
      * (including /api/status) for the duration. Second client gets 503 now. */
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
+    if (!uart_link_lock(PROXY_LOCK_ACQUIRE_MS)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_hdr(req, "Retry-After", "5");
         httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
@@ -137,7 +140,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     }
 
     /* static, not stack: 8 KB + 4 KB would overflow the 8 KB httpd task stack.
-     * Safe — handlers are serialised by s_proxy_mutex (one client at a time). */
+     * Safe — handlers are serialised by the link lock (one client at a time). */
     static char uart_buf[PROXY_UART_BUF_SIZE];
     static uint8_t decode_buf[PROXY_CHUNK_SIZE];
     int parse_failures = 0;
@@ -145,7 +148,7 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     /* No-progress stall window. The per-frame timeout resets on every successful
      * uart_receive_json (even stale-req_id frames), so it can't catch a miner
      * flooding stale frames after a client disconnect — the loop would spin
-     * forever holding s_proxy_mutex. This bounds total time WITHOUT a frame for
+     * forever holding the link lock. This bounds total time WITHOUT a frame for
      * OUR req_id; it's reset only on a matching frame below. */
     int64_t stall_deadline = esp_timer_get_time() + (int64_t)PROXY_REQ_TIMEOUT_MS * 1000;
 
@@ -202,6 +205,19 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
         if (strcmp(type->valuestring, "error") == 0) {
             cJSON *em = cJSON_GetObjectItem(msg, "message");
             ESP_LOGE(TAG, "Miner error: %s", em ? em->valuestring : "unknown");
+
+            /* Keep the miner's view of the ezShare link. Without it a failure
+             * is an undifferentiated 502; with it, /api/status can say whether
+             * the card was missing, the password was wrong, or the signal was
+             * too weak. */
+            cJSON *assoc_j  = cJSON_GetObjectItem(msg, "assoc");
+            cJSON *rssi_j   = cJSON_GetObjectItem(msg, "rssi");
+            cJSON *reason_j = cJSON_GetObjectItem(msg, "reason");
+            if (cJSON_IsBool(assoc_j) || cJSON_IsNumber(reason_j))
+                miner_link_note_diag(cJSON_IsTrue(assoc_j),
+                                     cJSON_IsNumber(rssi_j)   ? rssi_j->valueint   : 0,
+                                     cJSON_IsNumber(reason_j) ? reason_j->valueint : 0);
+
             if (!chunked_started) {
                 httpd_resp_set_status(req, "502 Bad Gateway");
                 httpd_resp_send(req, em ? em->valuestring : "Miner error",
@@ -354,7 +370,7 @@ cleanup:
     if (chunked_started && ret != ESP_OK) {
         proxy_send_abort_and_drain(req_id);
     }
-    xSemaphoreGive(s_proxy_mutex);
+    uart_link_unlock();
     return ret;
 }
 
@@ -380,7 +396,7 @@ static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
                                          uint32_t timeout_ms)
 {
     /* static: keep this 4 KB buffer off the 8 KB httpd task stack.
-     * Callers (handle_o2ring_status/live) hold s_proxy_mutex. */
+     * Callers (handle_o2ring_status/live) hold the link lock. */
     static char uart_buf[JSON_BUFFER_SIZE];
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
 
@@ -427,7 +443,7 @@ static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
 
 static esp_err_t handle_o2ring_status(httpd_req_t *req)
 {
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
+    if (!uart_link_lock(PROXY_LOCK_ACQUIRE_MS)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
     }
@@ -435,7 +451,7 @@ static esp_err_t handle_o2ring_status(httpd_req_t *req)
     int req_id = s_req_id;
 
     if (send_o2ring_req(req_id, "status", NULL) != ESP_OK) {
-        xSemaphoreGive(s_proxy_mutex);
+        uart_link_unlock();
         httpd_resp_set_status(req, "502 Bad Gateway");
         return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
     }
@@ -449,7 +465,7 @@ static esp_err_t handle_o2ring_status(httpd_req_t *req)
         if (json) { httpd_resp_sendstr(req, json); free(json); }
         cJSON_Delete(resp);
     }
-    xSemaphoreGive(s_proxy_mutex);
+    uart_link_unlock();
     return ESP_OK;
 }
 
@@ -467,7 +483,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
     /* Fast-fail on ACQUIRE only. Once held, the download may legitimately keep
      * the lock for O2RING_DOWNLOAD_TIMEOUT_MS — but a caller that finds it busy
      * must not park the httpd task for two minutes waiting its turn. */
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
+    if (!uart_link_lock(PROXY_LOCK_ACQUIRE_MS)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
     }
@@ -477,7 +493,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
     if (has_name) {
         /* Download mode — reuse proxy streaming */
         if (send_o2ring_req(req_id, "download", name_param) != ESP_OK) {
-            xSemaphoreGive(s_proxy_mutex);
+            uart_link_unlock();
             httpd_resp_set_status(req, "502 Bad Gateway");
             return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
         }
@@ -487,7 +503,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
         httpd_resp_set_hdr(req, "Content-Disposition", cd_hdr);
 
         /* Stream proxy_meta + proxy_chunks. static, not stack: 8 KB + 4 KB
-         * would overflow the 8 KB httpd task; serialised by s_proxy_mutex. */
+         * would overflow the 8 KB httpd task; serialised by the link lock. */
         static char uart_buf[PROXY_UART_BUF_SIZE];
         static uint8_t decode_buf[PROXY_CHUNK_SIZE];
         bool chunked_started = false;
@@ -594,7 +610,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
     } else {
         /* List mode */
         if (send_o2ring_req(req_id, "files", NULL) != ESP_OK) {
-            xSemaphoreGive(s_proxy_mutex);
+            uart_link_unlock();
             httpd_resp_set_status(req, "502 Bad Gateway");
             return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
         }
@@ -610,13 +626,13 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
         }
     }
 
-    xSemaphoreGive(s_proxy_mutex);
+    uart_link_unlock();
     return ESP_OK;
 }
 
 static esp_err_t handle_o2ring_live(httpd_req_t *req)
 {
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
+    if (!uart_link_lock(PROXY_LOCK_ACQUIRE_MS)) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
     }
@@ -624,7 +640,7 @@ static esp_err_t handle_o2ring_live(httpd_req_t *req)
     int req_id = s_req_id;
 
     if (send_o2ring_req(req_id, "live", NULL) != ESP_OK) {
-        xSemaphoreGive(s_proxy_mutex);
+        uart_link_unlock();
         httpd_resp_set_status(req, "502 Bad Gateway");
         return httpd_resp_send(req, "UART send failed", HTTPD_RESP_USE_STRLEN);
     }
@@ -638,7 +654,7 @@ static esp_err_t handle_o2ring_live(httpd_req_t *req)
         if (json) { httpd_resp_sendstr(req, json); free(json); }
         cJSON_Delete(resp);
     }
-    xSemaphoreGive(s_proxy_mutex);
+    uart_link_unlock();
     return ESP_OK;
 }
 
@@ -687,15 +703,58 @@ static esp_err_t handle_status(httpd_req_t *req)
     int64_t up = esp_timer_get_time() / 1000000LL;
     int secs = (int)(up % 60), mins = (int)((up / 60) % 60), hrs = (int)(up / 3600);
 
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-             "{\"state\":\"proxy\",\"wifi\":%s,\"mqtt\":false,"
-             "\"o2ring\":false,\"uptime\":\"%02d:%02d:%02d\"}",
-             wifi_manager_is_connected() ? "true" : "false",
-             hrs, mins, secs);
+    /* Was a fixed 256-byte string reporting "mqtt":false (there is no MQTT
+     * client anywhere in this project) and "o2ring":false regardless of the
+     * actual state. Phase 4 replaces this wholesale with the control server's
+     * version; for now it at least reports things that are true. */
+    cJSON *json = cJSON_CreateObject();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_ERR_NO_MEM;
+    }
 
+    char uptime[16];
+    snprintf(uptime, sizeof(uptime), "%02d:%02d:%02d", hrs, mins, secs);
+
+    cJSON_AddStringToObject(json, "state", "proxy");
+    cJSON_AddStringToObject(json, "fw", FW_VERSION);
+    cJSON_AddStringToObject(json, "miner_fw", miner_link_cached_version());
+    cJSON_AddBoolToObject(json, "wifi", wifi_manager_is_connected());
+    cJSON_AddStringToObject(json, "uptime", uptime);
+    cJSON_AddNumberToObject(json, "free_heap", (double)esp_get_free_heap_size());
+    /* Fragmentation, not total free, is what actually fails an allocation on a
+     * C3 — a device can report plenty free and still not find a contiguous
+     * block. Report both. */
+    cJSON_AddNumberToObject(json, "largest_block",
+        (double)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(json, "min_free", (double)esp_get_minimum_free_heap_size());
+
+    /* The miner's view of the ezShare card, from its last reported error.
+     * Absent until something has actually failed — which is the point: it
+     * answers "why did that request fail" rather than being a live probe. */
+    miner_ezshare_diag_t d;
+    miner_link_get_diag(&d);
+    if (d.valid) {
+        cJSON *ez = cJSON_AddObjectToObject(json, "ezshare");
+        if (ez) {
+            cJSON_AddBoolToObject(ez, "assoc", d.assoc);
+            cJSON_AddNumberToObject(ez, "rssi", d.rssi);
+            cJSON_AddNumberToObject(ez, "reason", d.reason);
+            int64_t age_s = (esp_timer_get_time() - d.when_us) / 1000000LL;
+            cJSON_AddNumberToObject(ez, "age_s", (double)age_s);   /* whole seconds */
+        }
+    }
+
+    char *out = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (!out) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_ERR_NO_MEM;
+    }
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, buf);
+    esp_err_t rc = httpd_resp_sendstr(req, out);
+    free(out);
+    return rc;
 }
 
 void file_server_register(httpd_handle_t server)

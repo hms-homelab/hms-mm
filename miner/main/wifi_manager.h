@@ -62,6 +62,20 @@ esp_err_t wifi_manager_wait_connection(uint32_t timeout_ms);
 /**
  * @brief Deinitialize WiFi manager
  */
+/**
+ * @brief Last raw WIFI_REASON_* code from the driver (0 if never disconnected).
+ *
+ * Reported to the mule with proxy errors. 201 (NO_AP_FOUND) means the card is
+ * off, asleep or out of range; 202 (AUTH_FAIL) means the password is wrong.
+ * Both otherwise surface as an indistinguishable 502.
+ */
+int wifi_manager_last_disc_reason(void);
+
+/**
+ * @brief Current AP RSSI in dBm, or 0 when not associated.
+ */
+int wifi_manager_rssi(void);
+
 void wifi_manager_deinit(void);
 
 #endif // WIFI_MANAGER_H

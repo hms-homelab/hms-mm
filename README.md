@@ -231,13 +231,43 @@ here means reflashing the pair.
 
 **Error:**
 ```json
-{"type":"error","id":1,"message":"ezShare unreachable","code":"WIFI_FAILED"}
+{"type":"error","id":1,"message":"ezShare unreachable","code":"WIFI_FAILED",
+ "assoc":false,"rssi":0,"reason":201}
 ```
+Every error carries the miner's view of the ezShare link, because otherwise all
+failures look like an identical `502` from the mule's side:
+
+| Diagnostic | Meaning |
+|---|---|
+| `assoc:false, reason:201` | AP not found — card off, asleep, or out of range |
+| `assoc:false, reason:202` | Authentication failed — wrong card password |
+| `assoc:true, rssi<=-80` | Associated but too weak to move data |
+
+The mule keeps the latest of these and reports it under `ezshare` in
+`/api/status`.
 
 **Config acknowledgment:**
 ```json
-{"type":"config_ack","status":"ok"}
+{"type":"config_ack","status":"ok","changed":true}
 ```
+`changed` tells the mule whether the miner is about to restart to apply new
+credentials. Identical credentials are acknowledged without a restart, so a
+mule reboot no longer drags the miner down with it.
+
+### Control messages
+
+Small request/response exchanges, all mule -> miner unless noted.
+
+| Send | Reply | Purpose |
+|---|---|---|
+| `{"type":"version_req"}` | `{"type":"version_resp","ver":"2026.0.6"}` | Miner firmware version; surfaces as `miner_fw` in `/api/status` |
+| `{"type":"reboot"}` | `{"type":"ack","of":"reboot"}` | Restart the miner, **config intact** |
+| `{"type":"reset"}` | `{"type":"ack","of":"reset"}` | Erase miner config and restart; the mule re-pushes credentials on its next boot |
+| `{"type":"o2_state_req"}` | `{"type":"o2_state_resp","enabled":false}` | Read the O2Ring BLE gate |
+| `{"type":"o2_set_enabled","enabled":true}` | `{"type":"o2_state_resp","enabled":true}` | Set the gate. The miner restarts to apply it, since the BLE stack is only brought up at init. A no-op change does not restart. |
+
+An `ack` may be lost — the miner can restart before it drains — so a missing
+ack is not proof the command was ignored.
 
 ### O2Ring Messages
 

@@ -44,6 +44,21 @@ esp_err_t uart_parse_json_field(const char *json_str, const char *field,
                                 void *value_out, int value_type);
 
 /**
+ * @brief Hold the link across a whole request/response exchange.
+ *
+ * The per-frame TX mutex only protects one write. A conversation is several
+ * frames, and two callers interleaving would steal each other's replies — the
+ * miner answers whoever reads next, not whoever asked. Everything that talks
+ * to the miner (the HTTP proxy handlers, the O2Ring endpoints, and the control
+ * endpoints added later) takes this for the duration of the exchange.
+ *
+ * @param timeout_ms  0 waits forever.
+ * @return true if acquired.
+ */
+bool uart_link_lock(uint32_t timeout_ms);
+void uart_link_unlock(void);
+
+/**
  * @brief Discard any partially-received frame and the driver's RX backlog.
  *
  * Call after abandoning a request so the next one does not begin by parsing

@@ -26,6 +26,13 @@ static wifi_status_t wifi_status = WIFI_STATUS_DISCONNECTED;
 static int retry_count = 0;
 static bool wifi_initialized = false;
 
+/* Last raw WIFI_REASON_* from the driver. Reported to the mule alongside a
+ * proxy error so an ezShare failure can be triaged without a serial cable:
+ * 201 NO_AP_FOUND (card off, asleep or out of range) and 202 AUTH_FAIL (wrong
+ * password) are entirely different problems that otherwise both surface as a
+ * bare 502. */
+static int last_disc_reason = 0;
+
 /**
  * @brief WiFi event handler
  */
@@ -37,14 +44,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_status = WIFI_STATUS_CONNECTING;
 
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
+        if (d) last_disc_reason = d->reason;
+
         if (retry_count < WIFI_MAXIMUM_RETRY) {
-            ESP_LOGI(TAG, "WiFi disconnected, retrying... (%d/%d)",
-                     retry_count + 1, WIFI_MAXIMUM_RETRY);
+            /* Always print the reason: it is the single most useful field when
+             * triaging an ezShare failure from a log, and without it every
+             * cause looks identical. */
+            ESP_LOGI(TAG, "WiFi disconnected (reason=%d), retrying... (%d/%d)",
+                     last_disc_reason, retry_count + 1, WIFI_MAXIMUM_RETRY);
             esp_wifi_connect();
             retry_count++;
             wifi_status = WIFI_STATUS_CONNECTING;
         } else {
-            ESP_LOGE(TAG, "WiFi connection failed after %d retries", WIFI_MAXIMUM_RETRY);
+            ESP_LOGE(TAG, "WiFi connection failed after %d retries (reason=%d)",
+                     WIFI_MAXIMUM_RETRY, last_disc_reason);
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
             wifi_status = WIFI_STATUS_ERROR;
         }
@@ -249,6 +263,16 @@ esp_err_t wifi_manager_wait_connection(uint32_t timeout_ms) {
     } else {
         return ESP_ERR_TIMEOUT;
     }
+}
+
+int wifi_manager_last_disc_reason(void) {
+    return last_disc_reason;
+}
+
+int wifi_manager_rssi(void) {
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return 0;   /* 0 = not associated */
+    return ap.rssi;
 }
 
 /**

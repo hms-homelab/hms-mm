@@ -16,7 +16,12 @@
 
 static const char *TAG = LOG_TAG_UART;
 static QueueHandle_t uart_queue = NULL;
-static SemaphoreHandle_t uart_mutex = NULL;
+static SemaphoreHandle_t uart_mutex = NULL;   /* one frame on the wire */
+
+/* Held across a whole request/response conversation — see uart_link_lock().
+ * Created lazily as well as at init, because a control endpoint can be served
+ * before uart_handler_init() has run on a slow boot. */
+static SemaphoreHandle_t link_mutex = NULL;
 static bool uart_initialized = false;
 
 /**
@@ -65,6 +70,7 @@ esp_err_t uart_handler_init(void) {
     }
 
     if (!uart_mutex) uart_mutex = xSemaphoreCreateMutex();
+    if (!link_mutex) link_mutex = xSemaphoreCreateMutex();
 
     uart_initialized = true;
     ESP_LOGI(TAG, "UART initialized successfully (TX: GPIO%d, RX: GPIO%d, Baud: %d)",
@@ -225,6 +231,24 @@ int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
     ESP_LOGW(TAG, "UART receive timeout (%u B buffered, no frame terminator)",
              (unsigned)s_accum_len);
     return -1;
+}
+
+bool uart_link_lock(uint32_t timeout_ms)
+{
+    /* Lazily created: a control endpoint can be served before
+     * uart_handler_init() has run, and silently not serialising would be worse
+     * than a slightly late allocation. */
+    if (!link_mutex) {
+        link_mutex = xSemaphoreCreateMutex();
+        if (!link_mutex) return false;
+    }
+    TickType_t wait = (timeout_ms == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTake(link_mutex, wait) == pdTRUE;
+}
+
+void uart_link_unlock(void)
+{
+    if (link_mutex) xSemaphoreGive(link_mutex);
 }
 
 /* Drop anything half-received. Called when the mule abandons a request (client

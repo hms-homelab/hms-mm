@@ -10,8 +10,10 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "esp_timer.h"
 #include "mule_task.h"
 #include "uart_handler.h"
+#include "miner_link.h"
 #include "nvs_config.h"
 #include "config.h"
 
@@ -20,7 +22,8 @@ static const char *TAG = LOG_TAG_MULE;
 static TaskHandle_t s_task = NULL;
 static bool s_running = false;
 
-static void send_ezshare_config(void)
+/* Returns true if the miner said it is restarting to apply new credentials. */
+static bool send_ezshare_config(void)
 {
     char ez_ssid[33] = {0}, ez_pass[65] = {0};
     if (nvs_config_has_ezshare()) {
@@ -28,7 +31,16 @@ static void send_ezshare_config(void)
         nvs_config_get_ezshare_pass(ez_pass, sizeof(ez_pass));
     }
 
-    if (ez_ssid[0] == '\0') return;
+    if (ez_ssid[0] == '\0') return false;
+
+    bool restarting = false;
+
+    /* Hold the link across send-and-ack: this runs concurrently with the HTTP
+     * handlers, and without the lock a client request landing here would
+     * consume the config_ack. */
+    if (!uart_link_lock(5000)) {
+        ESP_LOGW(TAG, "link busy — sending ezShare config unacknowledged");
+    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "set_config");
@@ -41,12 +53,48 @@ static void send_ezshare_config(void)
         free(json);
     }
     cJSON_Delete(root);
+
+    /* Wait for the ack. It was previously sent by the miner and read by nobody,
+     * so a miner that never received the config looked identical to one that
+     * did. It also tells us whether the miner is about to restart. */
+    static char buf[512];
+    int64_t deadline = esp_timer_get_time() + 3000 * 1000;
+    bool acked = false;
+    while (!acked && esp_timer_get_time() < deadline) {
+        if (uart_receive_json(buf, sizeof(buf), 300) <= 0) continue;
+        cJSON *msg = cJSON_Parse(buf);
+        if (!msg) continue;
+        cJSON *type = cJSON_GetObjectItem(msg, "type");
+        if (cJSON_IsString(type) && strcmp(type->valuestring, "config_ack") == 0) {
+            cJSON *ch = cJSON_GetObjectItem(msg, "changed");
+            restarting = cJSON_IsTrue(ch);
+            acked = true;
+        }
+        cJSON_Delete(msg);
+    }
+
+    uart_link_unlock();
+
+    if (!acked)
+        ESP_LOGW(TAG, "miner did not acknowledge ezShare config — is the link wired?");
+    else
+        ESP_LOGI(TAG, "miner acknowledged config (%s)",
+                 restarting ? "restarting to apply" : "already current");
+
+    return restarting;
 }
 
 static void mule_task_loop(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(MULE_BOOT_DELAY_SEC * 1000));
-    send_ezshare_config();
+    bool miner_restarting = send_ezshare_config();
+
+    /* Let the miner finish rebooting before asking it anything, or the version
+     * query just times out and caches "unknown" until something else asks. */
+    if (miner_restarting) vTaskDelay(pdMS_TO_TICKS(4000));
+
+    if (!miner_link_query_version(NULL, 0))
+        ESP_LOGW(TAG, "could not read miner firmware version at boot");
 
     while (s_running) {
         vTaskDelay(pdMS_TO_TICKS(10000));

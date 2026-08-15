@@ -81,6 +81,18 @@ static void send_error_json(int req_id, const char *message, const char *code)
     cJSON_AddNumberToObject(root, "id", req_id);
     cJSON_AddStringToObject(root, "message", message);
     cJSON_AddStringToObject(root, "code", code);
+
+    /* ezShare link diagnostics on every error. Without these a failure is just
+     * "502" and the causes are indistinguishable from the mule's side:
+     *   assoc=0 reason=201  card off / asleep / out of range (NO_AP_FOUND)
+     *   assoc=0 reason=202  wrong ezShare password (AUTH_FAIL)
+     *   assoc=1 rssi<=-80   associated but the link is too weak to move data
+     * Cheap to attach, and it is the difference between a support answer and a
+     * guess. The mule surfaces them on /api/status and in its logs. */
+    cJSON_AddBoolToObject(root, "assoc", wifi_manager_is_connected());
+    cJSON_AddNumberToObject(root, "rssi", wifi_manager_rssi());
+    cJSON_AddNumberToObject(root, "reason", wifi_manager_last_disc_reason());
+
     char *json = cJSON_PrintUnformatted(root);
     if (json) { uart_send_json(json); free(json); }
     cJSON_Delete(root);
@@ -317,22 +329,116 @@ static void handle_set_config(cJSON *root)
     cJSON *ssid_j = cJSON_GetObjectItem(root, "ez_ssid");
     cJSON *pass_j = cJSON_GetObjectItem(root, "ez_pass");
 
-    if (ssid_j && cJSON_IsString(ssid_j)) {
-        const char *new_pass = (pass_j && cJSON_IsString(pass_j)) ? pass_j->valuestring : "";
+    if (!ssid_j || !cJSON_IsString(ssid_j)) return;
+    const char *new_pass = (pass_j && cJSON_IsString(pass_j)) ? pass_j->valuestring : "";
+
+    /* The mule sends this on every one of its boots. Restarting unconditionally
+     * meant a mule reboot always dragged the miner down with it — including
+     * mid-transfer, if the mule had crashed and come back. Only restart when
+     * the credentials actually changed; a restart is how they take effect, so
+     * an unchanged config needs nothing. */
+    char cur_ssid[33] = {0}, cur_pass[65] = {0};
+    nvs_config_get_ezshare_ssid(cur_ssid, sizeof(cur_ssid));
+    nvs_config_get_ezshare_pass(cur_pass, sizeof(cur_pass));
+    bool changed = strcmp(cur_ssid, ssid_j->valuestring) != 0 ||
+                   strcmp(cur_pass, new_pass) != 0;
+
+    if (changed) {
         nvs_config_set_ezshare(ssid_j->valuestring, new_pass);
-        ESP_LOGI(TAG, "set_config: SSID=%s", ssid_j->valuestring);
+        ESP_LOGI(TAG, "set_config: SSID=%s (changed — restarting to apply)",
+                 ssid_j->valuestring);
+    } else {
+        ESP_LOGI(TAG, "set_config: SSID=%s (unchanged — staying up)",
+                 ssid_j->valuestring);
+    }
 
-        cJSON *ack = cJSON_CreateObject();
-        cJSON_AddStringToObject(ack, "type", "config_ack");
-        cJSON_AddStringToObject(ack, "status", "ok");
-        char *json = cJSON_PrintUnformatted(ack);
-        if (json) { uart_send_json(json); free(json); }
-        cJSON_Delete(ack);
+    cJSON *ack = cJSON_CreateObject();
+    cJSON_AddStringToObject(ack, "type", "config_ack");
+    cJSON_AddStringToObject(ack, "status", "ok");
+    /* The mule waits on this to know whether the miner is about to disappear. */
+    cJSON_AddBoolToObject(ack, "changed", changed);
+    char *json = cJSON_PrintUnformatted(ack);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(ack);
 
+    if (changed) {
         uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(2000));
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
     }
+}
+
+/* ── Control messages from the mule ────────────────────────────── */
+
+/* Send a small {"type":..., ...} frame with one extra field. */
+static void send_simple(const char *type, const char *key, cJSON *value)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) { if (value) cJSON_Delete(value); return; }
+    cJSON_AddStringToObject(root, "type", type);
+    if (key && value) cJSON_AddItemToObject(root, key, value);
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) { uart_send_json(json); free(json); }
+    cJSON_Delete(root);
+}
+
+/* Reboot after giving the reply time to reach the wire. uart_send_json already
+ * waits for the TX FIFO, but the mule still has to read and act on it, and a
+ * restart mid-flush would leave it waiting out a full timeout for a reply that
+ * was already gone. */
+static void reply_then_restart(const char *what)
+{
+    ESP_LOGW(TAG, "%s requested by mule — restarting", what);
+    uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static void handle_version_req(void)
+{
+    send_simple("version_resp", "ver", cJSON_CreateString(FW_VERSION));
+    ESP_LOGI(TAG, "version_req -> %s", FW_VERSION);
+}
+
+/* `reset` wipes config; `reboot` deliberately does not. Keeping them distinct
+ * is the whole point — a reboot is a routine recovery action, while a reset
+ * makes the miner forget the ezShare card. */
+static void handle_reset(void)
+{
+    nvs_config_erase_all();
+    send_simple("ack", "of", cJSON_CreateString("reset"));
+    reply_then_restart("reset");
+}
+
+static void handle_reboot(void)
+{
+    send_simple("ack", "of", cJSON_CreateString("reboot"));
+    reply_then_restart("reboot");
+}
+
+static void handle_o2_state_req(void)
+{
+    send_simple("o2_state_resp", "enabled", cJSON_CreateBool(nvs_config_ble_active()));
+}
+
+static void handle_o2_set_enabled(cJSON *root)
+{
+    cJSON *en = cJSON_GetObjectItem(root, "enabled");
+    if (!cJSON_IsBool(en)) {
+        ESP_LOGW(TAG, "o2_set_enabled without a boolean 'enabled' — ignoring");
+        return;
+    }
+    bool want = cJSON_IsTrue(en);
+    if (want == nvs_config_ble_active()) {
+        /* Already in the requested state. Answer and stay up rather than
+         * dropping the data link for a no-op. */
+        ESP_LOGI(TAG, "o2_set_enabled=%d already set — not restarting", want);
+        handle_o2_state_req();
+        return;
+    }
+    nvs_config_set_ble_active(want);
+    send_simple("o2_state_resp", "enabled", cJSON_CreateBool(want));
+    reply_then_restart("o2_set_enabled");
 }
 
 /* ── Main loop ─────────────────────────────────────────────────── */
@@ -360,6 +466,16 @@ static void scanner_task_loop(void *pvParameters)
 
                 if (strcmp(type->valuestring, "set_config") == 0) {
                     handle_set_config(root);
+                } else if (strcmp(type->valuestring, "version_req") == 0) {
+                    handle_version_req();
+                } else if (strcmp(type->valuestring, "reboot") == 0) {
+                    handle_reboot();
+                } else if (strcmp(type->valuestring, "reset") == 0) {
+                    handle_reset();
+                } else if (strcmp(type->valuestring, "o2_state_req") == 0) {
+                    handle_o2_state_req();
+                } else if (strcmp(type->valuestring, "o2_set_enabled") == 0) {
+                    handle_o2_set_enabled(root);
                 } else if (strcmp(type->valuestring, "o2ring_req") == 0) {
                     cJSON *id_j  = cJSON_GetObjectItem(root, "id");
                     cJSON *cmd_j = cJSON_GetObjectItem(root, "cmd");
