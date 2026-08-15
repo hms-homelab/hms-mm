@@ -69,6 +69,10 @@ can be updated without the other, so in the field they legitimately differ.
   The single remaining failure in 20 was a stall, not corruption: the ezShare
   card pausing longer than the timeout. That is a property of the card, and it
   now surfaces as a failed transfer rather than a short file.
+  The O2Ring download path is acknowledged the same way, and the mule now tells
+  the miner to stop when it abandons one instead of leaving it waiting on an
+  ack that is never coming with the ring still connected. Not yet exercised
+  against a physical ring.
 - **Removed the async HTTP worker pool.** Added in 2026.0.5 and never hardware
   tested; the upstream project it was ported from deleted the same pattern five
   days later because it crash-looped the C3 (~10 KB free heap, versus ~55 KB

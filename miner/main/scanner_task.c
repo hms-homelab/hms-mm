@@ -445,6 +445,23 @@ static bool o2_dl_chunk_cb(const uint8_t *data, size_t len, uint32_t offset, voi
         c->failed = true;
         return false;
     }
+
+    /* Same flow control as the ezShare path. Every chunk here is non-final —
+     * the end marker is sent after the download returns — so this always
+     * waits. Returning false unwinds the BLE read, which is what stops the
+     * ring being drained for a client that has gone away. */
+    int a = wait_chunk_ack(c->req_id);
+    if (a == -1) {
+        ESP_LOGW(TAG, "O2Ring download aborted by mule at chunk %u", (unsigned)c->seq);
+        c->failed = true;
+        return false;
+    }
+    if (a == -2) {
+        ESP_LOGE(TAG, "no ack for O2Ring chunk %u — mule stopped consuming", (unsigned)c->seq);
+        c->failed = true;
+        return false;
+    }
+
     c->seq++;
     return true;
 }

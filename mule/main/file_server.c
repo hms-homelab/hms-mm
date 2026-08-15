@@ -689,6 +689,10 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
                 }
                 expected_seq++;
 
+                /* Release the miner for the next chunk, only now that these
+                 * bytes are on their way to the client. */
+                if (!is_last) send_chunk_ack(req_id, expected_seq - 1);
+
                 if (is_last) {
                     httpd_resp_send_chunk(req, NULL, 0);
                     break;
@@ -704,6 +708,10 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
              * download rather than accepting a partial .vld as whole. */
             ESP_LOGE(TAG, "ABANDONING O2Ring download req_id=%d so the client sees a failure",
                      req_id);
+            /* Tell the miner to stop. Without this it sits waiting for an ack
+             * that is never coming and only gives up on its own timeout, with
+             * the ring still connected and the link still busy. */
+            proxy_send_abort_and_drain(req_id);
             uart_link_unlock();
             return ESP_FAIL;
         }
