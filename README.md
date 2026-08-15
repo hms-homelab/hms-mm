@@ -43,32 +43,11 @@ WiFi SD Card AP       UART, newline JSON       Home Network
 2. Mule takes the link lock and sends `proxy_req` over UART
 3. Miner connects to the ezShare WiFi on demand and fetches from the card
 4. Miner sends `proxy_meta` (status, length), then `proxy_chunk` frames
-5. Mule verifies each chunk, streams it to the HTTP client, then replies
-   `chunk_ack` — which is what releases the miner to send the next one
+5. Mule verifies each chunk, streams it to the HTTP client, and replies
+   `chunk_ack`
 6. Mule refuses to finalise the response unless the byte count matches the
    length the card promised
 7. Miner disconnects from the ezShare WiFi after an idle timeout (5 min)
-
-### Why every chunk is acknowledged
-
-The link is two wires. There is no hardware flow control, so if the miner
-streams at wire speed while the mule is still decoding the previous chunk and
-pushing it out over WiFi, the surplus is simply lost. Chunk CRCs catch that but
-cannot repair it. Acknowledging each chunk paces the miner to what the mule
-actually absorbs.
-
-On one bench setup, free-running transfers lost roughly a third of their
-downloads to CRC mismatches, and lowering the baud did not reliably help, while
-the same transfers acknowledged completed essentially every time. Those runs
-are in the commit history rather than here, deliberately: they came from one
-pair of boards joined one particular way, and how you join yours is your
-choice — jumper wires, copper tape, a board you had made. What one setup
-carries cleanly another will not.
-
-So take the mechanism, not the number. Acknowledging paces the miner to what
-the mule can absorb while it is busy on WiFi, and that holds however the boards
-are wired. `UART_BAUD_RATE` is the one knob, it must match on both boards, and
-if `/api/logs` shows chunk CRC mismatches, lower it.
 
 ## Setup
 
@@ -275,10 +254,9 @@ WiFi and BLE share the ESP32-C3 radio, so they run sequentially — the miner di
 
 ## UART Protocol
 
-Newline-delimited JSON at 460800 baud — one frame per line, so the link stays
-readable in a serial monitor. Both boards must run the same baud, so a change
-here means reflashing the pair. The rate is measured rather than chosen; see
-[Why every chunk is acknowledged](#why-every-chunk-is-acknowledged).
+Newline-delimited JSON — one frame per line, so the link stays readable in a
+serial monitor. Both boards must run the same baud (`UART_BAUD_RATE`), so
+changing it means reflashing the pair.
 
 ### Mule -> Miner
 
@@ -299,12 +277,10 @@ here means reflashing the pair. The rate is measured rather than chosen; see
 ```json
 {"type":"chunk_ack","id":1,"seq":0}
 ```
-Sent only once the decoded bytes have been handed to the HTTP client. The miner
-blocks after every non-final chunk until this arrives, which is the link's only
-flow control. No ack is sent for the final chunk: the mule finalises the
-response rather than asking for more. A miner that waits
-`PROXY_CHUNK_ACK_TIMEOUT_MS` (10 s) without hearing one gives up on the
-transfer. `proxy_abort` arriving instead of an ack means the client went away.
+Sent after each non-final `proxy_chunk` has been consumed. The miner waits for
+it before sending the next chunk, and gives up after
+`PROXY_CHUNK_ACK_TIMEOUT_MS`. No ack is sent for the final chunk. A
+`proxy_abort` in its place means the client disconnected.
 
 ### Miner -> Mule
 
