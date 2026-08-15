@@ -1,0 +1,144 @@
+name: release
+
+# On a version tag, build both boards and publish the binaries to a GitHub
+# Release. There is no cloud, no S3 and no signing here on purpose — hms-mm is
+# updated by USB or by pointing the mule's own /api/ota at a URL you control.
+#
+# Needs no repo secrets: GITHUB_TOKEN is enough to create the release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:        # build-only smoke test, publishes nothing
+
+permissions:
+  contents: write           # required to create the Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.3.4
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each board carries its own version. Resolve both up front: they name
+      # the artefacts, and the tag is checked against them.
+      - name: Resolve board versions
+        id: ver
+        shell: bash
+        run: |
+          read_ver() {
+            awk '
+              /#define[ \t]+VERSION_YEAR/  {y=$3}
+              /#define[ \t]+VERSION_MINOR/ {m=$3}
+              /#define[ \t]+VERSION_PATCH/ {p=$3}
+              END {print y "." m "." p}' "$1/main/version.h"
+          }
+          MULE=$(read_ver mule)
+          MINER=$(read_ver miner)
+          echo "mule=$MULE"   >> "$GITHUB_OUTPUT"
+          echo "miner=$MINER" >> "$GITHUB_OUTPUT"
+          echo "mule  $MULE"
+          echo "miner $MINER"
+
+      # The boards version independently, so a tag cannot match both. It must
+      # match at least ONE, which is what catches the real mistake: tagging a
+      # release without bumping either board.
+      - name: Check tag matches a board version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          MULE_VER: ${{ steps.ver.outputs.mule }}
+          MINER_VER: ${{ steps.ver.outputs.miner }}
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          echo "tag=$TAG_VER  mule=$MULE_VER  miner=$MINER_VER"
+          if [ "$TAG_VER" != "$MULE_VER" ] && [ "$TAG_VER" != "$MINER_VER" ]; then
+            echo "::error::tag v$TAG_VER matches neither mule ($MULE_VER) nor miner ($MINER_VER) — bump the board you changed and re-tag"
+            exit 1
+          fi
+
+      - name: Build mule and miner
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          for board in mule miner; do
+            echo "=== building $board ==="
+            (cd "$board" && idf.py set-target esp32c3 && idf.py build)
+          done
+
+      # Two artefacts per board: the app image on its own (what /api/ota and
+      # /api/update/{mule,miner} take), and a single merged image covering
+      # bootloader + partition table + app for a first-time USB flash at 0x0.
+      - name: Collect and merge images
+        shell: bash
+        env:
+          MULE_VER: ${{ steps.ver.outputs.mule }}
+          MINER_VER: ${{ steps.ver.outputs.miner }}
+        run: |
+          . "$IDF_PATH/export.sh"
+          mkdir -p dist
+          for board in mule miner; do
+            # Each artefact is named for ITS OWN board's version, not the tag —
+            # a release that bumps only one board still publishes both, and the
+            # filenames say plainly which is which.
+            case "$board" in
+              mule)  VER="$MULE_VER"  ;;
+              miner) VER="$MINER_VER" ;;
+            esac
+            B="$board/build"
+            cp "$B/hms-mm-$board.bin"                   "dist/$board-$VER.bin"
+            cp "$B/bootloader/bootloader.bin"           "dist/$board-$VER-bootloader.bin"
+            cp "$B/partition_table/partition-table.bin" "dist/$board-$VER-partitions.bin"
+            esptool.py --chip esp32c3 merge_bin \
+              --flash_mode dio --flash_size 4MB --flash_freq 80m \
+              -o "dist/$board-$VER-merged.bin" \
+              0x0    "$B/bootloader/bootloader.bin" \
+              0x8000 "$B/partition_table/partition-table.bin" \
+              0x10000 "$B/hms-mm-$board.bin"
+          done
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest        # no container: the release action needs node
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Flashing
+
+            **First time / recovery — full USB flash at offset 0x0:**
+            ```
+            esptool.py --chip esp32c3 -p PORT write_flash 0x0 mule-VERSION-merged.bin
+            esptool.py --chip esp32c3 -p PORT write_flash 0x0 miner-VERSION-merged.bin
+            ```
+
+            **App image only** (`mule-X.Y.Z.bin` / `miner-X.Y.Z.bin`) is what the
+            mule's own update endpoints take — no USB needed once a unit is on
+            your network.
+
+            The two boards **version independently**, so their filenames may
+            carry different numbers in the same release — that is expected, and
+            it means only one board changed. `/api/status` reports both (`fw`
+            and `miner_fw`).
+
+            Where a release note says the UART protocol changed, flash both
+            boards together: they must agree on the wire format and the baud.
+
+            Verify downloads against `SHA256SUMS.txt`.

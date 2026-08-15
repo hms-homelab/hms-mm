@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -16,6 +17,14 @@
 static const char *TAG = LOG_TAG_UART;
 static QueueHandle_t uart_queue = NULL;
 static bool uart_initialized = false;
+
+/* Serialises whole frames onto the wire. The mule has always had this; the
+ * miner did not, because for a long time scanner_task was the only thing that
+ * ever transmitted. Splitting the O2Ring BLE work into its own task makes that
+ * assumption false, and two interleaved writes would produce one unparseable
+ * line plus one lost frame — the kind of corruption that reads as a flaky
+ * cable. Added ahead of the split so the ordering is never briefly wrong. */
+static SemaphoreHandle_t uart_tx_mutex = NULL;
 
 /**
  * @brief Initialize UART with JSON protocol settings
@@ -62,6 +71,13 @@ esp_err_t uart_handler_init(void) {
         return ret;
     }
 
+    uart_tx_mutex = xSemaphoreCreateMutex();
+    if (uart_tx_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create UART TX mutex");
+        uart_driver_delete(UART_PORT_NUM);
+        return ESP_ERR_NO_MEM;
+    }
+
     uart_initialized = true;
     ESP_LOGI(TAG, "UART initialized successfully (TX: GPIO%d, RX: GPIO%d, Baud: %d)",
              UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
@@ -91,25 +107,145 @@ esp_err_t uart_send_json(const char *json_str) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Hold across BOTH writes: the body and its newline terminator must stay
+     * adjacent on the wire, or two concurrent senders produce one corrupt
+     * frame and one orphaned fragment. */
+    if (xSemaphoreTake(uart_tx_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "UART TX mutex timeout — frame dropped");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_OK;
+
     // Send JSON string
-    int written = uart_write_bytes(UART_PORT_NUM, json_str, len);
-    if (written < 0) {
+    if (uart_write_bytes(UART_PORT_NUM, json_str, len) < 0) {
         ESP_LOGE(TAG, "Failed to write UART bytes");
-        return ESP_FAIL;
-    }
-
-    // Send newline delimiter
-    written = uart_write_bytes(UART_PORT_NUM, "\n", 1);
-    if (written < 0) {
+        result = ESP_FAIL;
+    } else if (uart_write_bytes(UART_PORT_NUM, "\n", 1) < 0) {
+        // Send newline delimiter
         ESP_LOGE(TAG, "Failed to write newline");
-        return ESP_FAIL;
+        result = ESP_FAIL;
+    } else {
+        // Wait for transmission to complete
+        uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
+        ESP_LOGD(TAG, "Sent JSON (%u bytes): %.100s...", (unsigned)len, json_str);
     }
 
-    // Wait for transmission to complete
-    uart_wait_tx_done(UART_PORT_NUM, pdMS_TO_TICKS(1000));
+    xSemaphoreGive(uart_tx_mutex);
+    return result;
+}
 
-    ESP_LOGD(TAG, "Sent JSON (%d bytes): %.100s...", len, json_str);
-    return ESP_OK;
+/* ── Line assembler ──────────────────────────────────────────────────────
+ *
+ * The driver hands us an undelimited byte stream; frames are newline
+ * terminated. A block read can therefore return a partial frame, one whole
+ * frame, or several frames plus a fragment of the next — so whatever is not
+ * yet consumed has to survive between calls. That is what s_accum is for, and
+ * what makes block reads safe here.
+ *
+ * The previous implementation read ONE BYTE PER uart_read_bytes() call, which
+ * never over-reads and so needed no buffer. At 115200 that cost ~11k driver
+ * calls/second; at 921600 it would be ~92k, which is the wrong shape of work
+ * to be doing per byte on a C3 that is also driving WiFi or BLE.
+ */
+static char   s_accum[UART_LINE_MAX];
+static size_t s_accum_len;
+
+/* Pull whatever the driver has into the accumulator, blocking at most
+ * wait_ms. Returns the driver's return value (<0 on error). */
+static int accum_fill(uint32_t wait_ms)
+{
+    if (s_accum_len >= sizeof(s_accum)) return 0;      /* full; let the caller drain */
+    int n = uart_read_bytes(UART_PORT_NUM,
+                            (uint8_t *)s_accum + s_accum_len,
+                            sizeof(s_accum) - s_accum_len,
+                            pdMS_TO_TICKS(wait_ms));
+    if (n > 0) s_accum_len += (size_t)n;
+    return n;
+}
+
+/* Consume one complete frame if the accumulator holds one. Writes it to out
+ * NUL-terminated with the newline stripped, and returns its length.
+ * Returns -1 when no complete frame is buffered yet. */
+static int accum_take_line(char *out, size_t out_size)
+{
+    char *nl = memchr(s_accum, '\n', s_accum_len);
+    if (!nl) {
+        /* No terminator and no room left: this frame can never complete, so
+         * drop everything and resync on the next newline. Without this the
+         * link would wedge permanently on one oversized/corrupt frame. */
+        if (s_accum_len >= sizeof(s_accum)) {
+            ESP_LOGE(TAG, "no frame terminator in %u B — dropping buffer to resync",
+                     (unsigned)s_accum_len);
+            s_accum_len = 0;
+        }
+        return -1;
+    }
+
+    size_t line_len = (size_t)(nl - s_accum);
+    size_t consumed = line_len + 1;                    /* frame + its newline */
+    size_t copy     = line_len < out_size - 1 ? line_len : out_size - 1;
+    if (copy < line_len)
+        ESP_LOGW(TAG, "frame of %u B truncated into a %u B buffer",
+                 (unsigned)line_len, (unsigned)out_size);
+
+    memcpy(out, s_accum, copy);
+    out[copy] = '\0';
+
+    s_accum_len -= consumed;
+    memmove(s_accum, s_accum + consumed, s_accum_len);
+    return (int)copy;
+}
+
+/**
+ * @brief Non-blocking peek for a mid-stream "proxy_abort" from the mule.
+ *
+ * Called between chunks while streaming, so it must be cheap and must NOT
+ * disturb anything else in flight. Unlike the original it does not consume
+ * what it finds: a complete frame that is not an abort is left in the
+ * accumulator for uart_receive_json() to deliver normally. The old version
+ * read up to 256 bytes and threw them away, which was only safe while
+ * proxy_abort was the sole message the mule could send mid-stream — adding
+ * OTA, version and reboot frames breaks that assumption, and a swallowed
+ * command would look exactly like a link fault.
+ */
+bool uart_check_proxy_abort(void)
+{
+    if (!uart_initialized) return false;
+
+    accum_fill(0);                                     /* non-blocking */
+    if (s_accum_len == 0) return false;
+
+    char *nl = memchr(s_accum, '\n', s_accum_len);
+    if (!nl) return false;                             /* frame still arriving */
+
+    /* Cheap gate first: the quoted form only appears as a JSON *value*, and a
+     * parse on every peek would be wasteful when the buffered frame is some
+     * unrelated command we are deliberately leaving in place. */
+    size_t line_len = (size_t)(nl - s_accum);
+    *nl = '\0';
+    bool looks_like_abort = strstr(s_accum, "\"proxy_abort\"") != NULL;
+    *nl = '\n';
+    if (!looks_like_abort) return false;
+
+    /* Confirm it really is one before consuming it. */
+    char saved = s_accum[line_len];
+    s_accum[line_len] = '\0';
+    cJSON *msg = cJSON_Parse(s_accum);
+    s_accum[line_len] = saved;
+
+    bool is_abort = false;
+    if (msg) {
+        cJSON *type = cJSON_GetObjectItem(msg, "type");
+        is_abort = cJSON_IsString(type) && strcmp(type->valuestring, "proxy_abort") == 0;
+        cJSON_Delete(msg);
+    }
+    if (!is_abort) return false;
+
+    size_t consumed = line_len + 1;
+    s_accum_len -= consumed;
+    memmove(s_accum, s_accum + consumed, s_accum_len);
+    return true;
 }
 
 /**
@@ -119,75 +255,36 @@ esp_err_t uart_send_json(const char *json_str) {
  * @param timeout_ms Timeout in milliseconds
  * @return Number of bytes received (excluding newline), or -1 on error/timeout
  */
-bool uart_check_proxy_abort(void) {
-    /* Non-blocking peek for a mid-stream "proxy_abort" from the mule (HTTP client
-     * gone). The UART driver's RX ring buffer fills in the background, so an abort
-     * sent while we're streaming is waiting here. During a stream the scanner is
-     * the only UART reader and the mule sends nothing else, so a substring match
-     * is enough; consuming the bytes is fine (they are the abort). */
-    if (!uart_initialized) return false;
-    size_t avail = 0;
-    if (uart_get_buffered_data_len(UART_PORT_NUM, &avail) != ESP_OK || avail == 0)
-        return false;
-    static char buf[256];
-    size_t to_read = avail < sizeof(buf) - 1 ? avail : sizeof(buf) - 1;
-    int n = uart_read_bytes(UART_PORT_NUM, (uint8_t *)buf, to_read, 0);
-    if (n <= 0) return false;
-    buf[n] = '\0';
-    return strstr(buf, "proxy_abort") != NULL;
-}
-
-int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
+int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms)
+{
     if (!uart_initialized) {
         ESP_LOGE(TAG, "UART not initialized");
         return -1;
     }
-
     if (buffer == NULL || buffer_size == 0) {
         ESP_LOGE(TAG, "Invalid buffer");
         return -1;
     }
 
-    size_t idx = 0;
-    uint8_t byte;
-    TickType_t start_ticks = xTaskGetTickCount();
-    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    /* An earlier block read (or an abort peek) may already have buffered a
+     * whole frame — deliver that before touching the driver. */
+    int got = accum_take_line(buffer, buffer_size);
+    if (got >= 0) return got;
 
-    // Read bytes until newline or timeout
-    while (idx < buffer_size - 1) {
-        // Check timeout
-        if ((xTaskGetTickCount() - start_ticks) > timeout_ticks) {
-            ESP_LOGW(TAG, "UART receive timeout after %d bytes", idx);
-            return -1;
-        }
+    TickType_t start   = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
 
-        // Read one byte (non-blocking)
-        int len = uart_read_bytes(UART_PORT_NUM, &byte, 1, pdMS_TO_TICKS(100));
-
-        if (len < 0) {
+    do {
+        if (accum_fill(20) < 0) {
             ESP_LOGE(TAG, "UART read error");
             return -1;
         }
+        got = accum_take_line(buffer, buffer_size);
+        if (got >= 0) return got;
+    } while ((xTaskGetTickCount() - start) <= timeout);
 
-        if (len == 0) {
-            // No data available, continue waiting
-            continue;
-        }
-
-        // Check for newline delimiter
-        if (byte == '\n') {
-            buffer[idx] = '\0';
-            ESP_LOGD(TAG, "Received JSON (%d bytes): %.100s...", idx, buffer);
-            return idx;
-        }
-
-        // Store byte
-        buffer[idx++] = byte;
-    }
-
-    // Buffer overflow
-    ESP_LOGE(TAG, "UART receive buffer overflow");
-    buffer[buffer_size - 1] = '\0';
+    ESP_LOGW(TAG, "UART receive timeout (%u B buffered, no frame terminator)",
+             (unsigned)s_accum_len);
     return -1;
 }
 

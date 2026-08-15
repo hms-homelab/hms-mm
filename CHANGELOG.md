@@ -1,6 +1,85 @@
 # Changelog
 
-Version format: `YYYY.MINOR.PATCH`
+Version format: `YYYY.MINOR.PATCH`. The mule and the miner version
+independently — a release often touches one board and not the other, and either
+can be updated without the other, so in the field they legitimately differ.
+`/api/status` reports both (`fw` and `miner_fw`).
+
+## [Unreleased]
+
+### Breaking — flash both boards together
+
+- **UART baud 115200 to 921600.** The boards must agree on the baud, so a unit
+  running a mix of old and new firmware will not talk at all. Reflash the pair.
+  Raw link capacity goes from ~11.5 KB/s to ~92 KB/s; after base64's 4/3 tax
+  that is roughly 8.6 KB/s to 69 KB/s of payload. Backed off in one place
+  (`UART_BAUD_RATE`) if a rig shows framing errors.
+- **`proxy_chunk` gained a `c` field** (CRC32 of the decoded bytes). Frames
+  without it are still accepted, so the change itself is not what forces the
+  reflash — the baud is.
+
+### Fixed
+
+- **Removed the async HTTP worker pool.** Added in 2026.0.5 and never hardware
+  tested; the upstream project it was ported from deleted the same pattern five
+  days later because it crash-looped the C3 (~10 KB free heap, versus ~55 KB
+  stable once removed). The worker machinery is heap-fragile on a chip that is
+  already tight, and it was pretending there was concurrency to exploit: the
+  link is one wire to one single-threaded miner, and ezShare itself is
+  single-connection with keep-alive disabled. Handlers run synchronously again,
+  serialised by `s_proxy_mutex` exactly as before 2026.0.5, and the worker
+  task's ~4 KB comes back.
+- **A busy proxy no longer parks the whole HTTP server.** With the worker pool
+  gone, handlers run on the single httpd task, and the mutex acquire timeouts
+  (35 s for `/dir` and `/download`, 125 s for an O2Ring download) would have
+  blocked every other route — including `/api/status` — behind one transfer.
+  Acquiring now fast-fails after `PROXY_LOCK_ACQUIRE_MS` (3 s) with a `503` and
+  `Retry-After`. A transfer that already holds the lock still keeps it as long
+  as it genuinely needs.
+- **A lost chunk no longer produces a silently corrupt file.** A `seq` gap was
+  logged as a warning and otherwise ignored, so the client received a `200`
+  with a hole in it. Both streaming paths now abort the transfer instead.
+- **The O2Ring download path ignored `seq` entirely and skipped past a failed
+  base64 decode**, quietly dropping a chunk and returning a truncated `.vld`
+  that still looked like a success. It now aborts, and a client disconnect
+  breaks the loop rather than streaming into a dead socket.
+- **Chunk corruption is now detectable at all.** There was no integrity check
+  anywhere on the link — no parity, no checksum, and a successful base64 decode
+  proves nothing, because dropping bytes from a frame still decodes cleanly
+  into shorter garbage. Chunks now carry a CRC32 of the decoded bytes
+  (`esp_rom_crc32_le`, a ROM routine, so effectively free).
+- **The mid-stream abort peek no longer eats other messages.** It read up to
+  256 bytes of the RX buffer and discarded them on a bare substring match for
+  `proxy_abort`. That was only safe while an abort was the sole thing the mule
+  could send mid-stream; it now parses the frame to confirm, and leaves
+  anything else in place to be delivered normally.
+- **The miner had no UART TX mutex** (the mule always had one), which was fine
+  only while `scanner_task` was the sole transmitter. Added ahead of the task
+  split, so two interleaved writes can never produce one unparseable line plus
+  one lost frame.
+
+### Changed
+
+- **UART receive reads in blocks instead of one byte per driver call.** The old
+  loop called `uart_read_bytes` per byte — ~11k calls/second at the old baud,
+  and ~92k at the new one. A line assembler now buffers across calls, which is
+  what makes block reads safe when a read can return a partial frame, a whole
+  frame, or several frames plus a fragment. An unterminated buffer-filling
+  frame is dropped to resync rather than wedging the link forever.
+- RX ring buffers 8 KB to 16 KB (~178 ms of slack at 921600, with no hardware
+  flow control available on a two-wire link).
+- **Each board owns its version.** `version.h` moved from the repo root into
+  `mule/main/` and `miner/main/`. The root copy was included by nothing and had
+  drifted to `2026.0.5` while both boards independently defined `2026.0.6`.
+
+### Added
+
+- **Release CI** (`.github/workflows/release.yml`). On a `v*` tag: builds both
+  boards, publishes app images, bootloaders, partition tables, `*-merged.bin`
+  single-file images flashable at `0x0`, and `SHA256SUMS.txt`. Artefacts are
+  named for each board's own version. Fails if the tag matches neither board's
+  version, which catches tagging a release without bumping anything. Needs no
+  secrets beyond `GITHUB_TOKEN`.
 
 ## [2026.0.5] - 2026-06-21
 

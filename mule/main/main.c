@@ -21,7 +21,6 @@
 #include "nvs_config.h"
 #include "captive_portal.h"
 #include "file_server.h"
-#include "http_async.h"
 #include "mule_task.h"
 #include "config.h"
 
@@ -63,7 +62,6 @@ void app_main(void)
     }
 
     file_server_init();
-    http_async_init();   /* worker pool so blocking handlers don't wedge the httpd task */
 
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
     http_cfg.max_uri_handlers = 8;

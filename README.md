@@ -10,7 +10,7 @@ Solves the "two WiFi networks" problem: WiFi SD cards create their own AP, so a 
 ## Architecture
 
 ```
-                         UART (115200 baud)
+                         UART (921600 baud)
 WiFi SD Card AP          JSON + newline          Home Network
 (192.168.4.1)            TX/RX crossed           (your router)
     |                                                 |
@@ -186,7 +186,9 @@ WiFi and BLE share the ESP32-C3 radio, so they run sequentially — the miner di
 
 ## UART Protocol
 
-Newline-delimited JSON at 115200 baud.
+Newline-delimited JSON at 921600 baud — one frame per line, so the link stays
+readable in a serial monitor. Both boards must run the same baud, so a change
+here means reflashing the pair.
 
 ### Mule -> Miner
 
@@ -215,9 +217,15 @@ Newline-delimited JSON at 115200 baud.
 
 **Proxy chunk (streamed, base64-encoded):**
 ```json
-{"type":"proxy_chunk","id":1,"seq":0,"d":"<base64>","last":false}
+{"type":"proxy_chunk","id":1,"seq":0,"c":2276608578,"d":"<base64>","last":false}
 ```
-- `seq` — chunk sequence number
+- `seq` — chunk sequence number. A gap aborts the transfer; the mule will not
+  hand the client a response with a hole in it.
+- `c` — CRC32 of the **decoded** bytes. The link has no parity, checksum or
+  hardware flow control, and base64 will happily decode a frame that lost bytes
+  into shorter, well-formed garbage — so a successful decode proves nothing and
+  this is what actually catches corruption. Sent as a JSON number; read it as a
+  double, since a CRC above 2^31 will not fit a 32-bit signed int.
 - `d` — base64-encoded binary data
 - `last` — true on final chunk
 

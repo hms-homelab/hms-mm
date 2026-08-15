@@ -3,9 +3,11 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
-// Firmware identity
+// Firmware identity. The version lives in this board's own version.h — the mule
+// and miner version independently. Do not define a version literal here.
+#include "version.h"
 #define FW_PROJECT          "hms-mm"
-#define FW_VERSION          "2026.0.6"
+#define FW_VERSION          FIRMWARE_VERSION
 
 // =============================================================================
 // Miner config — ezShare creds from NVS first, Kconfig fallback
@@ -28,12 +30,16 @@
 // tape board does the TX->RX crossover via the 180-deg module layout.
 // GPIO2 is a strapping pin but is always TX (idles high), so it stays boot-safe.
 #define UART_PORT_NUM               UART_NUM_1
-#define UART_BAUD_RATE              115200
+// Must match the mule exactly — see the note in mule/main/config.h. Changing
+// the baud is a breaking link change: flash both boards together.
+#define UART_BAUD_RATE              921600
 #define UART_TX_PIN                 GPIO_NUM_2
 #define UART_RX_PIN                 GPIO_NUM_3
-#define UART_RX_BUFFER_SIZE         8192
+#define UART_RX_BUFFER_SIZE         16384
 #define UART_TX_BUFFER_SIZE         8192
 #define UART_QUEUE_SIZE             20
+// Longest single newline-delimited frame; see mule/main/config.h.
+#define UART_LINE_MAX               8192
 
 // Scanner task
 #define SCANNER_TASK_STACK_SIZE     8192

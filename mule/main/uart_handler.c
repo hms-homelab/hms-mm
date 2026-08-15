@@ -118,7 +118,7 @@ esp_err_t uart_send_json(const char *json_str) {
 
     if (uart_mutex) xSemaphoreGive(uart_mutex);
 
-    ESP_LOGD(TAG, "Sent JSON (%d bytes): %.100s...", len, json_str);
+    ESP_LOGD(TAG, "Sent JSON (%u bytes): %.100s...", (unsigned)len, json_str);
     return ESP_OK;
 }
 
@@ -129,6 +129,71 @@ esp_err_t uart_send_json(const char *json_str) {
  * @param timeout_ms Timeout in milliseconds
  * @return Number of bytes received (excluding newline), or -1 on error/timeout
  */
+/* ── Line assembler ──────────────────────────────────────────────────────
+ *
+ * The driver hands us an undelimited byte stream; frames are newline
+ * terminated. A block read can therefore return a partial frame, one whole
+ * frame, or several frames plus a fragment of the next — so whatever is not
+ * yet consumed has to survive between calls. That is what s_accum is for, and
+ * what makes block reads safe here.
+ *
+ * The previous implementation read ONE BYTE PER uart_read_bytes() call, which
+ * never over-reads and so needed no buffer. At 115200 that cost ~11k driver
+ * calls/second; at 921600 it would be ~92k, which is the wrong shape of work
+ * to be doing per byte on a C3 that is also serving HTTP.
+ *
+ * Kept deliberately identical to the miner's copy in miner/main/uart_handler.c
+ * — the two must agree, so change them together.
+ */
+static char   s_accum[UART_LINE_MAX];
+static size_t s_accum_len;
+
+/* Pull whatever the driver has into the accumulator, blocking at most
+ * wait_ms. Returns the driver's return value (<0 on error). */
+static int accum_fill(uint32_t wait_ms)
+{
+    if (s_accum_len >= sizeof(s_accum)) return 0;      /* full; let the caller drain */
+    int n = uart_read_bytes(UART_PORT_NUM,
+                            (uint8_t *)s_accum + s_accum_len,
+                            sizeof(s_accum) - s_accum_len,
+                            pdMS_TO_TICKS(wait_ms));
+    if (n > 0) s_accum_len += (size_t)n;
+    return n;
+}
+
+/* Consume one complete frame if the accumulator holds one. Writes it to out
+ * NUL-terminated with the newline stripped, and returns its length.
+ * Returns -1 when no complete frame is buffered yet. */
+static int accum_take_line(char *out, size_t out_size)
+{
+    char *nl = memchr(s_accum, '\n', s_accum_len);
+    if (!nl) {
+        /* No terminator and no room left: this frame can never complete, so
+         * drop everything and resync on the next newline. Without this the
+         * link would wedge permanently on one oversized/corrupt frame. */
+        if (s_accum_len >= sizeof(s_accum)) {
+            ESP_LOGE(TAG, "no frame terminator in %u B — dropping buffer to resync",
+                     (unsigned)s_accum_len);
+            s_accum_len = 0;
+        }
+        return -1;
+    }
+
+    size_t line_len = (size_t)(nl - s_accum);
+    size_t consumed = line_len + 1;                    /* frame + its newline */
+    size_t copy     = line_len < out_size - 1 ? line_len : out_size - 1;
+    if (copy < line_len)
+        ESP_LOGW(TAG, "frame of %u B truncated into a %u B buffer",
+                 (unsigned)line_len, (unsigned)out_size);
+
+    memcpy(out, s_accum, copy);
+    out[copy] = '\0';
+
+    s_accum_len -= consumed;
+    memmove(s_accum, s_accum + consumed, s_accum_len);
+    return (int)copy;
+}
+
 int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
     if (!uart_initialized) {
         ESP_LOGE(TAG, "UART not initialized");
@@ -140,47 +205,35 @@ int uart_receive_json(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
         return -1;
     }
 
-    size_t idx = 0;
-    uint8_t byte;
-    TickType_t start_ticks = xTaskGetTickCount();
-    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    /* An earlier block read may already have buffered a whole frame — deliver
+     * that before touching the driver. */
+    int got = accum_take_line(buffer, buffer_size);
+    if (got >= 0) return got;
 
-    // Read bytes until newline or timeout
-    while (idx < buffer_size - 1) {
-        // Check timeout
-        if ((xTaskGetTickCount() - start_ticks) > timeout_ticks) {
-            ESP_LOGW(TAG, "UART receive timeout after %d bytes", idx);
-            return -1;
-        }
+    TickType_t start   = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
 
-        // Read one byte (non-blocking)
-        int len = uart_read_bytes(UART_PORT_NUM, &byte, 1, pdMS_TO_TICKS(100));
-
-        if (len < 0) {
+    do {
+        if (accum_fill(20) < 0) {
             ESP_LOGE(TAG, "UART read error");
             return -1;
         }
+        got = accum_take_line(buffer, buffer_size);
+        if (got >= 0) return got;
+    } while ((xTaskGetTickCount() - start) <= timeout);
 
-        if (len == 0) {
-            // No data available, continue waiting
-            continue;
-        }
-
-        // Check for newline delimiter
-        if (byte == '\n') {
-            buffer[idx] = '\0';
-            ESP_LOGD(TAG, "Received JSON (%d bytes): %.100s...", idx, buffer);
-            return idx;
-        }
-
-        // Store byte
-        buffer[idx++] = byte;
-    }
-
-    // Buffer overflow
-    ESP_LOGE(TAG, "UART receive buffer overflow");
-    buffer[buffer_size - 1] = '\0';
+    ESP_LOGW(TAG, "UART receive timeout (%u B buffered, no frame terminator)",
+             (unsigned)s_accum_len);
     return -1;
+}
+
+/* Drop anything half-received. Called when the mule abandons a request (client
+ * gone) so the NEXT request does not open with the tail of the previous
+ * response still sitting in the assembler. */
+void uart_rx_flush(void)
+{
+    s_accum_len = 0;
+    uart_flush_input(UART_PORT_NUM);
 }
 
 /**

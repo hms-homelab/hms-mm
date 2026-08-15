@@ -11,6 +11,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "cJSON.h"
+#include "esp_rom_crc.h"
 #include "mbedtls/base64.h"
 #include "scanner_task.h"
 #include "uart_handler.h"
@@ -118,6 +119,16 @@ static esp_err_t send_proxy_chunk(int req_id, size_t seq, bool is_last,
     cJSON_AddNumberToObject(root, "id", req_id);
     cJSON_AddNumberToObject(root, "seq", seq);
     cJSON_AddBoolToObject(root, "last", is_last);
+    /* CRC32 of the RAW bytes, so the mule can prove what it decoded is what we
+     * read off the card. There is no integrity check anywhere below this: the
+     * link has no parity, no checksum and no hardware flow control, and at
+     * 921600 the realistic failure is a dropped byte under RX pressure rather
+     * than a flipped bit. Base64 hides that — drop three bytes and the
+     * remainder still decodes cleanly into plausible garbage. Cheap here:
+     * esp_rom_crc32_le is a ROM routine.
+     * Sent as a JSON number, so the mule must read valuedouble — a CRC above
+     * 2^31 overflows cJSON's int field. */
+    cJSON_AddNumberToObject(root, "c", (double)esp_rom_crc32_le(0, data, data_len));
     cJSON_AddStringToObject(root, "d", s_b64_buf);
 
     char *json = cJSON_PrintUnformatted(root);

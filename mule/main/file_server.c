@@ -9,11 +9,11 @@
 #include "file_server.h"
 #include "uart_handler.h"
 #include "wifi_manager.h"
-#include "http_async.h"
 #include "config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "cJSON.h"
+#include "esp_rom_crc.h"
 #include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -113,8 +113,12 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
     esp_err_t ret = ESP_FAIL;
     bool chunked_started = false;
 
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_REQ_TIMEOUT_MS + 5000)) != pdTRUE) {
+    /* Fast-fail, not a long block: handlers run on the single httpd task, so
+     * waiting out someone else's download here would stall every other route
+     * (including /api/status) for the duration. Second client gets 503 now. */
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Retry-After", "5");
         httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
         return ESP_ERR_INVALID_STATE;
     }
@@ -250,14 +254,34 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
             cJSON *seq_j  = cJSON_GetObjectItem(msg, "seq");
             cJSON *d_j    = cJSON_GetObjectItem(msg, "d");
             cJSON *last_j = cJSON_GetObjectItem(msg, "last");
+            cJSON *crc_j  = cJSON_GetObjectItem(msg, "c");
             bool is_last = last_j && cJSON_IsTrue(last_j);
 
+            /* A gap in the sequence means a frame was lost, and every byte we
+             * have already sent the client is now followed by a hole. We
+             * cannot recover mid-response (the bytes are gone downstream), so
+             * fail the transfer and let the client retry — previously this was
+             * logged and ignored, which silently produced a corrupt file. */
             if (seq_j && seq_j->valueint != expected_seq) {
-                ESP_LOGW(TAG, "Chunk seq mismatch: expected=%d got=%d",
+                ESP_LOGE(TAG, "Chunk seq gap: expected=%d got=%d — aborting transfer",
                          expected_seq, seq_j->valueint);
+                cJSON_Delete(msg);
+                if (!chunked_started) {
+                    httpd_resp_set_status(req, "502 Bad Gateway");
+                    httpd_resp_send(req, "Lost a chunk from the miner", HTTPD_RESP_USE_STRLEN);
+                } else {
+                    httpd_resp_send_chunk(req, NULL, 0);
+                }
+                ret = ESP_FAIL;
+                goto cleanup;
             }
 
             if (!d_j || !cJSON_IsString(d_j)) { cJSON_Delete(msg); continue; }
+
+            /* Read the CRC out before freeing msg. Number, not int: a CRC
+             * above 2^31 does not fit cJSON's valueint. */
+            bool     have_crc = cJSON_IsNumber(crc_j);
+            uint32_t want_crc = have_crc ? (uint32_t)crc_j->valuedouble : 0;
 
             size_t decoded_len = 0;
             int rc = mbedtls_base64_decode(decode_buf, sizeof(decode_buf), &decoded_len,
@@ -275,6 +299,26 @@ static esp_err_t proxy_forward_request(httpd_req_t *req, const char *path,
                 }
                 ret = ESP_FAIL;
                 goto cleanup;
+            }
+
+            /* Base64 will happily decode a frame that lost bytes in transit
+             * into shorter, well-formed garbage, so the decode succeeding
+             * proves nothing about the payload. The CRC does. */
+            if (have_crc) {
+                uint32_t got_crc = esp_rom_crc32_le(0, decode_buf, decoded_len);
+                if (got_crc != want_crc) {
+                    ESP_LOGE(TAG, "Chunk CRC mismatch seq=%d (want %08lx got %08lx, %u B)",
+                             expected_seq, (unsigned long)want_crc,
+                             (unsigned long)got_crc, (unsigned)decoded_len);
+                    if (!chunked_started) {
+                        httpd_resp_set_status(req, "502 Bad Gateway");
+                        httpd_resp_send(req, "Corrupt chunk from the miner", HTTPD_RESP_USE_STRLEN);
+                    } else {
+                        httpd_resp_send_chunk(req, NULL, 0);
+                    }
+                    ret = ESP_FAIL;
+                    goto cleanup;
+                }
             }
 
             if (!chunked_started) {
@@ -383,14 +427,7 @@ static cJSON *wait_o2ring_json_response(httpd_req_t *req, int req_id,
 
 static esp_err_t handle_o2ring_status(httpd_req_t *req)
 {
-    if (!http_async_on_worker()) {
-        if (http_async_dispatch(req, handle_o2ring_status) == ESP_OK) return ESP_OK;
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
     }
@@ -418,13 +455,6 @@ static esp_err_t handle_o2ring_status(httpd_req_t *req)
 
 static esp_err_t handle_o2ring_files(httpd_req_t *req)
 {
-    if (!http_async_on_worker()) {
-        if (http_async_dispatch(req, handle_o2ring_files) == ESP_OK) return ESP_OK;
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
     char query[512] = {0};
     char name_param[64] = {0};
     bool has_name = false;
@@ -434,7 +464,10 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
             has_name = true;
     }
 
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(O2RING_DOWNLOAD_TIMEOUT_MS + 5000)) != pdTRUE) {
+    /* Fast-fail on ACQUIRE only. Once held, the download may legitimately keep
+     * the lock for O2RING_DOWNLOAD_TIMEOUT_MS — but a caller that finds it busy
+     * must not park the httpd task for two minutes waiting its turn. */
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
     }
@@ -501,9 +534,19 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
             if (strcmp(type->valuestring, "proxy_chunk") == 0) {
                 cJSON *d_j = cJSON_GetObjectItem(msg, "d");
                 cJSON *last_j = cJSON_GetObjectItem(msg, "last");
+                cJSON *seq_j = cJSON_GetObjectItem(msg, "seq");
+                cJSON *crc_j = cJSON_GetObjectItem(msg, "c");
                 bool is_last = last_j && cJSON_IsTrue(last_j);
 
                 if (!d_j || !cJSON_IsString(d_j)) { cJSON_Delete(msg); continue; }
+
+                /* Same integrity rules as the ezShare path. This loop used to
+                 * ignore seq entirely and `continue` past a failed decode,
+                 * which quietly dropped a chunk and handed the client a
+                 * truncated .vld that still looked like a successful 200. */
+                bool seq_gap = seq_j && seq_j->valueint != expected_seq;
+                bool     have_crc = cJSON_IsNumber(crc_j);
+                uint32_t want_crc = have_crc ? (uint32_t)crc_j->valuedouble : 0;
 
                 size_t decoded_len = 0;
                 int rc = mbedtls_base64_decode(decode_buf, sizeof(decode_buf), &decoded_len,
@@ -511,14 +554,33 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
                                                 strlen(d_j->valuestring));
                 cJSON_Delete(msg);
 
-                if (rc != 0) continue;
+                const char *bad = NULL;
+                if (seq_gap)      bad = "chunk sequence gap";
+                else if (rc != 0) bad = "base64 decode failed";
+                else if (have_crc && esp_rom_crc32_le(0, decode_buf, decoded_len) != want_crc)
+                    bad = "chunk CRC mismatch";
+
+                if (bad) {
+                    ESP_LOGE(TAG, "O2Ring download req_id=%d aborted: %s (seq=%d)",
+                             req_id, bad, expected_seq);
+                    if (chunked_started) {
+                        httpd_resp_send_chunk(req, NULL, 0);   /* truncate, don't pretend */
+                    } else {
+                        httpd_resp_set_status(req, "502 Bad Gateway");
+                        httpd_resp_send(req, bad, HTTPD_RESP_USE_STRLEN);
+                    }
+                    break;
+                }
 
                 if (!chunked_started) {
                     httpd_resp_set_type(req, "application/octet-stream");
                     chunked_started = true;
                 }
 
-                httpd_resp_send_chunk(req, (const char *)decode_buf, decoded_len);
+                if (httpd_resp_send_chunk(req, (const char *)decode_buf, decoded_len) != ESP_OK) {
+                    ESP_LOGW(TAG, "HTTP client disconnected during O2Ring download");
+                    break;
+                }
                 expected_seq++;
 
                 if (is_last) {
@@ -554,14 +616,7 @@ static esp_err_t handle_o2ring_files(httpd_req_t *req)
 
 static esp_err_t handle_o2ring_live(httpd_req_t *req)
 {
-    if (!http_async_on_worker()) {
-        if (http_async_dispatch(req, handle_o2ring_live) == ESP_OK) return ESP_OK;
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    if (xSemaphoreTake(s_proxy_mutex, pdMS_TO_TICKS(PROXY_LOCK_ACQUIRE_MS)) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return httpd_resp_send(req, "Proxy busy", HTTPD_RESP_USE_STRLEN);
     }
@@ -591,13 +646,6 @@ static esp_err_t handle_o2ring_live(httpd_req_t *req)
 
 static esp_err_t handle_dir(httpd_req_t *req)
 {
-    if (!http_async_on_worker()) {
-        if (http_async_dispatch(req, handle_dir) == ESP_OK) return ESP_OK;
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
     char query[MAX_PATH * 2] = {0};
     char dir_param[MAX_PATH] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
@@ -616,13 +664,6 @@ static esp_err_t handle_dir(httpd_req_t *req)
 
 static esp_err_t handle_download(httpd_req_t *req)
 {
-    if (!http_async_on_worker()) {
-        if (http_async_dispatch(req, handle_download) == ESP_OK) return ESP_OK;
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_send(req, "Server busy", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
     char query[MAX_PATH * 2] = {0};
     char file_param[MAX_PATH] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||

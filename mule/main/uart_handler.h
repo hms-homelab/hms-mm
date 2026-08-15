@@ -44,6 +44,14 @@ esp_err_t uart_parse_json_field(const char *json_str, const char *field,
                                 void *value_out, int value_type);
 
 /**
+ * @brief Discard any partially-received frame and the driver's RX backlog.
+ *
+ * Call after abandoning a request so the next one does not begin by parsing
+ * the tail of the previous response.
+ */
+void uart_rx_flush(void);
+
+/**
  * @brief Deinitialize UART
  */
 void uart_handler_deinit(void);

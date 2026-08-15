@@ -3,9 +3,11 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
-// Firmware identity
+// Firmware identity. The version lives in this board's own version.h — the mule
+// and miner version independently. Do not define a version literal here.
+#include "version.h"
 #define FW_PROJECT          "hms-mm"
-#define FW_VERSION          "2026.0.6"
+#define FW_VERSION          FIRMWARE_VERSION
 
 // Home WiFi defaults (overridden by NVS if captive portal was used)
 #define HOME_WIFI_SSID_DEFAULT      "your_wifi_ssid"
@@ -17,12 +19,21 @@
 // tape board does the TX->RX crossover via the 180-deg module layout.
 // GPIO2 is a strapping pin but is always TX (idles high), so it stays boot-safe.
 #define UART_PORT_NUM               UART_NUM_1
-#define UART_BAUD_RATE              115200
+// 921600 over a few cm of copper tape. There is no hardware flow control — the
+// tape board carries only TX/RX/GND/3V3 — so the RX ring is what absorbs a
+// reader that falls behind; 16 KB is ~178 ms of slack at this rate. If a rig
+// ever shows framing errors, this is the one knob to dial back (460800, then
+// 230400); both boards must be reflashed together when it changes.
+#define UART_BAUD_RATE              921600
 #define UART_TX_PIN                 GPIO_NUM_2
 #define UART_RX_PIN                 GPIO_NUM_3
-#define UART_RX_BUFFER_SIZE         8192
+#define UART_RX_BUFFER_SIZE         16384
 #define UART_TX_BUFFER_SIZE         8192
 #define UART_QUEUE_SIZE             20
+// Longest single newline-delimited frame. A proxy_chunk is PROXY_CHUNK_SIZE
+// base64'd (4/3) plus the JSON envelope, so this must stay comfortably above
+// PROXY_CHUNK_SIZE * 4 / 3.
+#define UART_LINE_MAX               8192
 
 // Mule task (boot-time config only)
 #define MULE_TASK_STACK_SIZE        8192
@@ -39,6 +50,10 @@
                                             // worker pool keeps the httpd task responsive.
 #define PROXY_ABORT_DRAIN_MS        2000    // cap on draining the miner's leftover chunks
                                             // after a mid-stream client disconnect
+#define PROXY_LOCK_ACQUIRE_MS       3000    // fast-fail budget for acquiring s_proxy_mutex. The
+                                            // handlers run on the single httpd task, so a second
+                                            // client must get an immediate 503 rather than pin
+                                            // that task for the length of someone else's download.
 
 // O2Ring UART timeouts (BLE operations are slower than ezShare HTTP)
 #define O2RING_STATUS_TIMEOUT_MS    20000
