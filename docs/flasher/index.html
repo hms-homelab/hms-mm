@@ -1,0 +1,528 @@
+<!doctype html>
+<!--
+  Web flasher for hms-mm.
+
+  This page is not served from the repository. .github/workflows/pages.yml
+  copies it to the Pages site, fills in the version and tag placeholders below
+  (spelled with leading and trailing double underscores, so they are easy to
+  grep for), and drops the release's merged images and their manifests into
+  firmware/ next to it. The firmware has to be same-origin: GitHub release assets are served
+  without an Access-Control-Allow-Origin header, so a browser cannot fetch them
+  from here.
+
+  Two boards, so two flash buttons, and then a third step this page owns
+  outright: the settings form talks to the mule's USB provisioning listener
+  (mule/main/serial_config.c) over Web Serial and writes the WiFi and ezShare
+  credentials straight into NVS. That replaces joining the MM-Setup-XXXX AP.
+
+  Nothing is installed to use this. esp-web-tools drives esptool over Web
+  Serial, which means Chrome or Edge on a desktop, over HTTPS.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash hms-mm</title>
+<meta name="description" content="Flash the hms-mm mule and miner firmware onto two ESP32-C3 boards from your browser, and set their WiFi up on the same page.">
+<!-- Inline so the page stays a single file and never 404s for a favicon. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23667EEA'/%3E%3Cpath d='M8.6 2.5 4.2 9.1h3l-.8 4.4 4.4-6.6h-3z' fill='%230F1120'/%3E%3C/svg%3E">
+<style>
+  /* Palette matches the mule's own captive portal and device page. */
+  :root {
+    color-scheme: dark;
+    --bg: #0F1120;
+    --panel: #1A1D35;
+    --panel-hi: #252840;
+    --line: #2A2D45;
+    --text: #E0E0E0;
+    --muted: #9AA1B1;
+    --accent: #667EEA;
+    --accent-ink: #0F1120;
+    --warn: #FBBF24;
+    --ok: #4ADE80;
+    --bad: #F87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2.5rem 1.25rem 4rem;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .35rem; letter-spacing: -.02em; }
+  h2 { font-size: 1.05rem; margin: 2.25rem 0 .75rem; letter-spacing: -.01em; }
+  p { margin: 0 0 1rem; }
+  .sub { color: var(--muted); margin-bottom: 2rem; }
+  .sub code { color: var(--text); }
+  code, kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .875em;
+  }
+  kbd {
+    background: var(--panel-hi); border: 1px solid var(--line);
+    border-radius: 4px; padding: .1em .4em;
+  }
+  a { color: var(--accent); }
+
+  /* Board picker */
+  .boards { display: grid; gap: .75rem; margin: 0 0 1.5rem; }
+  @media (min-width: 34rem) { .boards { grid-template-columns: 1fr 1fr; } }
+  .board {
+    display: block; cursor: pointer; padding: 1rem 1.1rem;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; transition: border-color .12s, background .12s;
+  }
+  .board:hover { background: var(--panel-hi); }
+  .board input { position: absolute; opacity: 0; pointer-events: none; }
+  .board:has(input:checked) { border-color: var(--accent); background: var(--panel-hi); }
+  .board:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .board .name { font-weight: 600; display: block; }
+  .board .detail { color: var(--muted); font-size: .875rem; display: block; margin-top: .15rem; }
+
+  /* Panels */
+  .flash, .settings {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 1.5rem;
+  }
+  .flash { text-align: center; }
+  esp-web-install-button { --esp-tools-button-color: var(--accent); }
+  button.primary {
+    font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px; padding: .7rem 1.6rem;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button.primary:disabled { opacity: .5; cursor: default; filter: none; }
+  .unsupported { color: var(--warn); margin: 0; text-align: left; }
+  .flash-note { color: var(--muted); font-size: .875rem; margin: .9rem 0 0; }
+
+  /* Settings form */
+  .field { margin-bottom: 1rem; }
+  .field:last-of-type { margin-bottom: 1.25rem; }
+  label.lbl { display: block; font-weight: 600; font-size: .9rem; margin-bottom: .3rem; }
+  .hint { color: var(--muted); font-size: .8125rem; margin: .25rem 0 0; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: .6rem .75rem; font: inherit;
+    background: var(--panel-hi); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  fieldset { border: 0; padding: 0; margin: 0 0 1.25rem; }
+  legend { font-weight: 600; font-size: .9rem; padding: 0; margin-bottom: .6rem; }
+  .row-check { display: flex; align-items: center; gap: .5rem; margin-bottom: 1.25rem;
+               color: var(--muted); font-size: .875rem; }
+  .status { margin: 1rem 0 0; font-size: .9rem; min-height: 1.6em; }
+  .status.ok  { color: var(--ok); }
+  .status.bad { color: var(--bad); }
+  .status.busy { color: var(--muted); }
+
+  /* Content blocks */
+  ol, ul { margin: 0 0 1rem; padding-left: 1.25rem; }
+  li { margin-bottom: .4rem; }
+  .callout {
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--warn);
+    border-radius: 0 8px 8px 0; padding: .9rem 1.1rem; margin: 0 0 1rem;
+  }
+  .callout p:last-child { margin-bottom: 0; }
+  details {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: .75rem 1.1rem; margin-bottom: .6rem;
+  }
+  details[open] { padding-bottom: .25rem; }
+  summary { cursor: pointer; font-weight: 600; }
+  footer {
+    margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .875rem;
+  }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>Flash hms-mm</h1>
+  <p class="sub">
+    Puts mule <strong>v__MULE_VERSION__</strong> and miner
+    <strong>v__MINER_VERSION__</strong> onto their ESP32-C3 boards straight from
+    this page, then sends them your WiFi and SD card details over the same cable.
+    Nothing to install and nothing to build. The two boards version
+    independently, so those numbers can differ.
+  </p>
+
+  <div class="callout">
+    <p>
+      <strong>hms-mm is two boards, not one.</strong> The <strong>mule</strong>
+      joins your home WiFi and serves the files; the <strong>miner</strong> talks
+      to the ezShare card and the O2Ring. They run different firmware, so flash
+      each one separately below. If you only have one board in front of you,
+      flash it and come back for the other.
+    </p>
+  </div>
+
+  <h2>1. Which board is plugged in?</h2>
+  <p>
+    Plug in one board at a time, over its <strong>native USB port</strong>. That
+    is the port the settings step in section 3 talks to, so it is the one to use
+    for both halves of this page.
+  </p>
+
+  <div class="boards">
+    <label class="board">
+      <input type="radio" name="board" value="mule" checked>
+      <span class="name">Mule</span>
+      <span class="detail">Joins your home WiFi. HTTP server on port 80. This is the one that gets your settings in step 3.</span>
+    </label>
+    <label class="board">
+      <input type="radio" name="board" value="miner">
+      <span class="name">Miner</span>
+      <span class="detail">Connects to the ezShare card's WiFi and to the O2Ring over BLE. Gets its settings from the mule.</span>
+    </label>
+  </div>
+
+  <h2>2. Flash it</h2>
+
+  <div class="flash">
+    <esp-web-install-button id="installer" manifest="firmware/manifest-mule.json">
+      <button class="primary" slot="activate">Connect and flash</button>
+      <p class="unsupported" slot="unsupported">
+        This browser cannot talk to serial devices. Open this page in
+        <strong>Chrome</strong> or <strong>Edge</strong> on a desktop or laptop.
+        Safari, Firefox and every mobile browser lack the Web Serial API.
+      </p>
+      <p class="unsupported" slot="not-allowed">
+        This page has to be served over HTTPS to reach a serial port.
+      </p>
+    </esp-web-install-button>
+    <p class="flash-note">
+      Your browser will ask which serial port to use. Pick the one that appears
+      when you plug the board in. Flashing takes about a minute; leave the cable
+      alone until it says it is done. Then swap the cable to the other board,
+      change the choice above, and flash again.
+    </p>
+  </div>
+
+  <p>
+    Choose <strong>Erase device</strong> if the board is new or has run other
+    firmware. Leave it unticked to keep an existing mule's saved WiFi and ezShare
+    settings, which live in a separate flash area and survive a reflash.
+  </p>
+
+  <h2>3. Send it your settings</h2>
+  <p>
+    With the <strong>mule</strong> plugged in and flashed, fill this in. It goes
+    down the USB cable into the mule's storage, and the mule passes the SD card
+    credentials on to the miner over their shared link at the next boot. You do
+    not have to join any setup network.
+  </p>
+
+  <div class="settings">
+    <form id="settings-form">
+      <fieldset>
+        <legend>Your home WiFi</legend>
+        <div class="field">
+          <label class="lbl" for="ssid">Network name</label>
+          <input type="text" id="ssid" name="ssid" maxlength="32" autocomplete="off"
+                 spellcheck="false" required placeholder="e.g. my-house">
+          <p class="hint">2.4 GHz only. The ESP32-C3 has no 5 GHz radio, so a
+             5 GHz-only network will never appear to it.</p>
+        </div>
+        <div class="field">
+          <label class="lbl" for="pass">Password</label>
+          <input type="password" id="pass" name="pass" maxlength="64" autocomplete="off">
+          <p class="hint">Leave empty for an open network.</p>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>The SD card's own WiFi</legend>
+        <div class="field">
+          <label class="lbl" for="ez_ssid">Card network name</label>
+          <input type="text" id="ez_ssid" name="ez_ssid" maxlength="32" autocomplete="off"
+                 spellcheck="false" value="ez Share">
+        </div>
+        <div class="field">
+          <label class="lbl" for="ez_pass">Card password</label>
+          <input type="password" id="ez_pass" name="ez_pass" maxlength="64" autocomplete="off"
+                 value="88888888">
+          <p class="hint">These are the ezShare factory defaults. Change them only
+             if you changed them on the card.</p>
+        </div>
+      </fieldset>
+
+      <div class="row-check">
+        <input type="checkbox" id="show-pw">
+        <label for="show-pw">Show passwords</label>
+      </div>
+
+      <button type="submit" class="primary" id="send">Connect and send settings</button>
+      <p class="status" id="status" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+
+  <p>
+    The mule restarts, joins your network, and serves the card's files at
+    <code>http://cpapdash.local/</code>. Nothing you type here leaves your
+    machine: it goes over the USB cable and nowhere else.
+  </p>
+
+  <h2>4. Point hms-cpap at it</h2>
+  <p>
+    On the machine running <a href="https://github.com/hms-homelab/hms-cpap">hms-cpap</a>,
+    set the mule as the data source in <code>~/.hms-cpap/config.json</code>. The
+    mule speaks the ezShare HTTP protocol, so no other change is needed:
+  </p>
+  <pre style="background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.9rem 1.1rem;overflow-x:auto"><code>"source": "ezshare",
+"ezshare_url": "http://cpapdash.local"</code></pre>
+
+  <h2>If something goes wrong</h2>
+
+  <details>
+    <summary>No port appears when I plug the board in</summary>
+    <p>
+      Usually the cable. Plenty of USB-C cables carry power only, and a board
+      that lights up can still have no data connection. Try a different cable
+      first, and make sure you are in the board's native USB port rather than a
+      separate serial bridge.
+    </p>
+  </details>
+
+  <details>
+    <summary>The settings step says it cannot find a mule</summary>
+    <p>
+      It sent a hello down the cable and nothing answered. Either the board on
+      the other end is the miner, which does not take settings, or the mule was
+      flashed with mule firmware older than 1.0.1, which has no USB provisioning
+      listener. Reflash the mule from step 2 and try again.
+    </p>
+    <p>
+      If it is definitely the mule on definitely the current firmware, unplug and
+      replug the board, then press the button again. Chrome hangs on to a port
+      handle across the reset that follows flashing.
+    </p>
+  </details>
+
+  <details>
+    <summary>I would rather use the setup network</summary>
+    <p>
+      Still there, unchanged. A mule with no stored WiFi comes up as an open
+      network called <code>MM-Setup-XXXX</code>, where the last four characters
+      come from its serial. Join it and a setup page opens, or visit
+      <code>http://192.168.4.1/</code>. It asks for exactly the same four things
+      this page does.
+    </p>
+  </details>
+
+  <details>
+    <summary>Flashing fails partway through</summary>
+    <p>
+      Close anything else holding the port (Arduino IDE, a serial monitor, a
+      previous tab of this page) and try again. A failed flash cannot brick the
+      board; the ROM bootloader is in silicon and holding <kbd>BOOT</kbd> while
+      tapping <kbd>RESET</kbd> always gets you back to download mode.
+    </p>
+  </details>
+
+  <details>
+    <summary>I would rather build it myself</summary>
+    <p>
+      Everything this page does is in the repository. See
+      <a href="https://github.com/hms-homelab/hms-mm#setup">Build and
+      flash</a> for the ESP-IDF route.
+    </p>
+  </details>
+
+  <footer>
+    <p>
+      hms-mm __TAG__ &middot; mule v__MULE_VERSION__, miner v__MINER_VERSION__ &middot;
+      <a href="https://github.com/hms-homelab/hms-mm">source</a> &middot;
+      <a href="https://github.com/hms-homelab/hms-mm/releases/tag/__TAG__">release notes</a>
+      &middot; MIT
+    </p>
+    <p>
+      Flashing runs entirely in your browser, using
+      <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>. No
+      firmware, serial data or credentials reach any server.
+    </p>
+  </footer>
+
+</main>
+
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<script>
+  // ── Board picker ────────────────────────────────────────────────────────
+  // The install button reads its manifest attribute when it is clicked, so
+  // swapping the attribute in place is enough, with no need to rebuild the
+  // element.
+  const installer = document.getElementById('installer');
+  for (const radio of document.querySelectorAll('input[name="board"]')) {
+    radio.addEventListener('change', () => {
+      const path = `firmware/manifest-${radio.value}.json`;
+      installer.manifest = path;
+      installer.setAttribute('manifest', path);
+    });
+  }
+
+  // ── Settings over Web Serial ────────────────────────────────────────────
+  // Speaks the line protocol in mule/main/serial_config.c: newline-terminated
+  // JSON out, and a reply line prefixed "HMSMM " back. The prefix matters
+  // because ESP_LOG output shares this port, so the next line to arrive is
+  // usually a log line rather than the answer.
+  const form = document.getElementById('settings-form');
+  const sendBtn = document.getElementById('send');
+  const statusEl = document.getElementById('status');
+
+  document.getElementById('show-pw').addEventListener('change', (e) => {
+    const type = e.target.checked ? 'text' : 'password';
+    for (const id of ['pass', 'ez_pass']) document.getElementById(id).type = type;
+  });
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  if (!('serial' in navigator)) {
+    sendBtn.disabled = true;
+    setStatus('This browser cannot talk to serial devices. Use Chrome or Edge on a desktop.', 'bad');
+  } else if (!window.isSecureContext) {
+    sendBtn.disabled = true;
+    setStatus('This page has to be served over HTTPS to reach a serial port.', 'bad');
+  }
+
+  // One connection per attempt: opened when the button is pressed, closed in a
+  // finally, so a failed attempt never leaves the port locked against a retry.
+  class MuleLink {
+    constructor(port) {
+      this.port = port;
+      this.decoder = new TextDecoder();
+      this.encoder = new TextEncoder();
+      this.buffer = '';
+      this.waiters = [];
+      this.reader = port.readable.getReader();
+      this.writer = port.writable.getWriter();
+      this.pump();
+    }
+
+    async pump() {
+      try {
+        for (;;) {
+          const { value, done } = await this.reader.read();
+          if (done) break;
+          this.buffer += this.decoder.decode(value, { stream: true });
+          let i;
+          while ((i = this.buffer.indexOf('\n')) >= 0) {
+            const line = this.buffer.slice(0, i).replace(/\r$/, '');
+            this.buffer = this.buffer.slice(i + 1);
+            if (line.startsWith('HMSMM ')) {
+              const waiter = this.waiters.shift();
+              if (waiter) waiter.resolve(line.slice(6));
+            }
+          }
+        }
+      } catch (err) {
+        // The port going away mid-read is normal: the mule resets itself right
+        // after acknowledging a provision.
+      }
+    }
+
+    // Sends one command and resolves with the parsed reply, or null on timeout.
+    //
+    // A timed-out waiter is dropped from the queue rather than left in it. Left
+    // there it would absorb the answer to the *next* command, so one slow reply
+    // would put every later exchange permanently one answer behind.
+    async ask(command, timeoutMs) {
+      const waiter = { resolve: null };
+      const reply = new Promise((resolve) => {
+        waiter.resolve = resolve;
+        this.waiters.push(waiter);
+        setTimeout(() => {
+          const at = this.waiters.indexOf(waiter);
+          if (at >= 0) this.waiters.splice(at, 1);
+          resolve(null);
+        }, timeoutMs);
+      });
+      await this.writer.write(this.encoder.encode(JSON.stringify(command) + '\n'));
+      const text = await reply;
+      if (text === null) return null;
+      try { return JSON.parse(text); } catch { return null; }
+    }
+
+    async close() {
+      try { await this.reader.cancel(); } catch {}
+      try { this.reader.releaseLock(); } catch {}
+      try { this.writer.releaseLock(); } catch {}
+      try { await this.port.close(); } catch {}
+    }
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    const values = {
+      cmd: 'provision',
+      ssid: document.getElementById('ssid').value.trim(),
+      pass: document.getElementById('pass').value,
+      ez_ssid: document.getElementById('ez_ssid').value.trim(),
+      ez_pass: document.getElementById('ez_pass').value,
+    };
+    if (!values.ssid) {
+      setStatus('Enter your WiFi network name first.', 'bad');
+      return;
+    }
+
+    let port;
+    try {
+      port = await navigator.serial.requestPort();
+    } catch {
+      setStatus('No port picked.', 'bad');
+      return;
+    }
+
+    sendBtn.disabled = true;
+    let link;
+    try {
+      setStatus('Opening the port…', 'busy');
+      await port.open({ baudRate: 115200 });
+      link = new MuleLink(port);
+
+      // A board that has just been reset spends a second or two booting before
+      // the listener exists, and a log line can land on top of a reply, so this
+      // asks a few times rather than trusting one shot.
+      setStatus('Looking for the mule…', 'busy');
+      let hello = null;
+      for (let attempt = 0; attempt < 6 && !hello; attempt++) {
+        hello = await link.ask({ cmd: 'ping' }, 1500);
+      }
+
+      if (!hello) {
+        setStatus('Nothing answered on that port. Is this the mule, and is it running 2026.0.5 or newer?', 'bad');
+        return;
+      }
+      if (hello.role !== 'mule') {
+        setStatus(`That board says it is the ${hello.role}. Settings go to the mule.`, 'bad');
+        return;
+      }
+
+      setStatus(`Found the mule (${hello.serial || 'no serial'}, firmware ${hello.fw}). Saving…`, 'busy');
+      const saved = await link.ask(values, 5000);
+
+      if (!saved) {
+        setStatus('The mule stopped answering before it confirmed. Nothing was saved; try again.', 'bad');
+      } else if (saved.ok) {
+        setStatus('Saved. The mule is restarting and will join your network in a few seconds.', 'ok');
+      } else {
+        setStatus(`The mule rejected it: ${saved.error || 'unknown reason'}`, 'bad');
+      }
+    } catch (err) {
+      setStatus(`Could not talk to the board: ${err.message}`, 'bad');
+    } finally {
+      if (link) await link.close(); else { try { await port.close(); } catch {} }
+      sendBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

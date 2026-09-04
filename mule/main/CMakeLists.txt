@@ -13,6 +13,7 @@ idf_component_register(
         "ota_miner.c"
         "ota_service.c"
         "mule_task.c"
+        "serial_config.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

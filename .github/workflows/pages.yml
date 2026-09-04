@@ -1,0 +1,129 @@
+# Publishes the browser-based flasher at
+#   https://hms-homelab.github.io/hms-mm/
+#
+# Runs after a release is published, so the page always offers whatever the
+# newest release contains. It never builds firmware: it takes the merged images
+# straight from the release assets, which is the same file anyone would download
+# and flash by hand.
+#
+# The images have to be copied onto the site rather than linked. GitHub serves
+# release assets without an Access-Control-Allow-Origin header, so a fetch()
+# from the Pages origin is blocked by the browser.
+#
+# Pages source must be set to "GitHub Actions" once, under Settings > Pages.
+#
+# On triggers: release.yml calls this directly, because a release created with
+# GITHUB_TOKEN does NOT raise a `release` event that can start another workflow.
+# GitHub suppresses that to stop workflows triggering themselves, so relying on
+# `on: release` alone silently deploys nothing for our own releases. That trigger
+# is kept anyway for a release published by hand in the web UI, which does carry
+# a real user and so does fire.
+name: web flasher
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (defaults to the latest release)
+        required: false
+        type: string
+
+# Only one deployment at a time, and never cancel one halfway: an interrupted
+# deploy can leave the site serving a manifest whose firmware is not there yet.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: publish flasher
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Work out which release to publish
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag="${INPUT_TAG:-$EVENT_TAG}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --json tagName --jq .tagName)
+          fi
+          echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"  >> "$GITHUB_OUTPUT"
+          echo "Publishing the flasher for $tag"
+
+      # The two boards version independently, so the assets are matched by
+      # shape rather than by the tag: a release tagged for the mule still
+      # carries the miner image at the miner's own version.
+      - name: Fetch the release firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir -p site/firmware
+          gh release download "$TAG" \
+             --pattern 'mule-*-merged.bin' \
+             --pattern 'miner-*-merged.bin' \
+             --dir site/firmware
+          ls -l site/firmware
+
+      - name: Assemble the site
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          # Writes the manifests, and reports the version it read off each
+          # image so the page can name them.
+          python3 .github/scripts/build_flasher_manifests.py site/firmware | tee versions.env
+          mule=$(sed -n 's/^mule_version=//p'  versions.env)
+          miner=$(sed -n 's/^miner_version=//p' versions.env)
+          if [ -z "$mule" ] || [ -z "$miner" ]; then
+            echo "::error::could not read both board versions from the manifests"
+            exit 1
+          fi
+
+          # The page is checked in with placeholders so it can be opened and
+          # edited without a build step.
+          sed -e "s/__MULE_VERSION__/$mule/g" \
+              -e "s/__MINER_VERSION__/$miner/g" \
+              -e "s/__TAG__/$TAG/g" \
+              docs/flasher/index.html > site/index.html
+          if grep -q '__[A-Z_]*__' site/index.html; then
+            echo "::error::a placeholder survived substitution"
+            grep -n '__[A-Z_]*__' site/index.html
+            exit 1
+          fi
+          # Jekyll would otherwise try to process the site and can drop files.
+          touch site/.nojekyll
+          rm -f versions.env
+          find site -type f | sort
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

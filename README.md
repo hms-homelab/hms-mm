@@ -60,6 +60,33 @@ WiFi SD Card AP       UART, newline JSON       Home Network
    length the card promised
 7. Miner disconnects from the ezShare WiFi after an idle timeout (5 min)
 
+## Install
+
+Two boards, so two images. The quickest route needs nothing installed:
+
+**[Web flasher: hms-homelab.github.io/hms-mm](https://hms-homelab.github.io/hms-mm/)** — Chrome or Edge on a desktop.
+
+1. Plug the **mule** into its native USB port, pick "Mule" on the page, and flash.
+2. Move the cable to the **miner**, pick "Miner", and flash.
+3. Plug the mule back in and fill in the settings form: home WiFi, plus the SD card's
+   own WiFi (`ez Share` / `88888888` on a stock ezShare). The page writes them down the
+   USB cable into the mule's NVS; the mule passes the card credentials to the miner at
+   the next boot.
+4. The mule joins your network and serves the card at `http://cpapdash.local/`.
+
+Nothing typed there leaves the machine — it goes over the USB cable, not to a server.
+The settings step needs mule firmware 1.0.1 or newer; the `MM-Setup-XXXX` portal is
+unchanged and still works for anything older, see
+[Configure WiFi](#4-configure-wifi-captive-portal-or-usb).
+
+To install by hand from a [release](https://github.com/hms-homelab/hms-mm/releases)
+instead — the merged image covers bootloader, partition table and app at once:
+
+```bash
+esptool.py --chip esp32c3 write_flash 0x0 mule-<version>-merged.bin
+esptool.py --chip esp32c3 write_flash 0x0 miner-<version>-merged.bin
+```
+
 ## Setup
 
 ### 1. Install ESP-IDF
@@ -114,7 +141,12 @@ idf.py build
 idf.py -p /dev/cu.usbmodemYYYY flash
 ```
 
-### 4. Configure WiFi (Captive Portal)
+### 4. Configure WiFi (Captive Portal or USB)
+
+The [web flasher](#install) does this over USB and is the easier route. The captive
+portal below is the fallback, and the only route for a mule on firmware older than
+1.0.1.
+
 
 <img src="docs/img/setup-portal.png" alt="hms-mm setup portal" width="300">
 
@@ -292,7 +324,7 @@ Every frame carries the `id` of the request it belongs to; frames for another
 
 | Priority | Source | How to set |
 |----------|--------|------------|
-| 1 | NVS (runtime) | Captive portal setup form |
+| 1 | NVS (runtime) | Web flasher settings form (USB) or captive portal setup form |
 | 2 | config.h (compile-time) | Edit source and rebuild |
 
 NVS credentials override compile-time defaults.
@@ -319,11 +351,59 @@ hms-mm/
       uart_handler.c/h      # UART JSON TX/RX
       wifi_manager.c/h      # WiFi STA (connects to home network)
       captive_portal.c/h    # AP mode WiFi setup with DNS hijack
+      serial_config.c/h     # USB provisioning listener, for the web flasher
       file_server.c/h       # HTTP proxy server + O2Ring endpoints
       nvs_config.c/h        # NVS storage for WiFi + SD card credentials
       config.h              # Pin assignments, timeouts, defaults
     partitions.csv
+  docs/flasher/index.html   # The web flasher page (published to GitHub Pages)
+  .github/
+    workflows/
+      release.yml           # Tag -> build -> release -> republish the flasher
+      pages.yml             # Publishes the flasher against a release's assets
+    scripts/
+      build_flasher_manifests.py  # ESP Web Tools manifests, verified after writing
+      test_flasher.py             # Drives the page against a fake serial mule
 ```
+
+## USB Provisioning Protocol
+
+What the web flasher speaks to the mule (`mule/main/serial_config.c`). Newline-delimited
+JSON over the mule's USB Serial/JTAG port. Every reply is one line prefixed `HMSMM `,
+because `ESP_LOG` output shares this port and the next line to arrive is usually a log
+line, not the answer.
+
+```json
+{"cmd":"ping"}
+HMSMM {"ok":true,"role":"mule","fw":"1.0.1","serial":"MM-1A2B","wifi":false,"ezshare":false}
+
+{"cmd":"provision","ssid":"my-house","pass":"...","ez_ssid":"ez Share","ez_pass":"88888888"}
+HMSMM {"ok":true,"restarting":true}
+```
+
+`ping` exists so a client can tell a mule from a miner before writing credentials to the
+wrong board. `provision` stores the credentials and restarts; the miner gets its copy of
+the SD card credentials from `mule_task` at the next boot, which is what makes the restart
+part of provisioning rather than a convenience.
+
+## Releases and the Web Flasher
+
+The flasher at <https://hms-homelab.github.io/hms-mm/> serves whatever the newest release
+contains: `pages.yml` copies that release's merged images onto the Pages site and writes
+an ESP Web Tools manifest for each. The images are copied rather than linked because
+GitHub serves release assets with no `Access-Control-Allow-Origin` header, so a browser
+cannot fetch them from the Pages origin.
+
+`release.yml` calls `pages.yml` explicitly at the end of a release. That call is not
+decoration: a release created with `GITHUB_TOKEN` raises no `release` event, so
+`pages.yml`'s own `on: release` trigger never fires for our own releases.
+
+Because the boards version independently, the flasher matches assets by shape
+(`mule-*-merged.bin`) and reads each version off the filename, so a release tagged for one
+board still publishes the other at its own version.
+
+To check the page without hardware, stage a site and run the browser test — the header of
+`.github/scripts/test_flasher.py` has the commands.
 
 ## 3D-Printed Board
 

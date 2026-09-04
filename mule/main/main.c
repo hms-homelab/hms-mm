@@ -5,8 +5,9 @@
  * Boot flow:
  *   1. NVS init
  *   2. UART init
- *   3. WiFi: NVS -> Kconfig -> captive portal
- *   4. Start HTTP proxy server + mule task (sends ezShare config to miner)
+ *   3. USB provisioning listener (browser flasher)
+ *   4. WiFi: NVS -> Kconfig -> captive portal
+ *   5. Start HTTP proxy server + mule task (sends ezShare config to miner)
  */
 
 #include <stdio.h>
@@ -27,6 +28,7 @@
 #include "crash_guard.h"
 #include "miner_link.h"
 #include "mule_task.h"
+#include "serial_config.h"
 #include "config.h"
 
 static const char *TAG = "MAIN";
@@ -43,6 +45,11 @@ void app_main(void)
      * could itself crash. */
     crash_guard_init();
     uart_handler_init();
+
+    /* Before the link probe and everything after it: each of the branches
+     * below can end in a restart or the setup portal, and the browser flasher
+     * has to be able to provision the mule in all of them. */
+    serial_config_start();
 
     /* Probe the link before touching WiFi. The miner version was previously
      * only read once the network was up, so a unit that could not join told

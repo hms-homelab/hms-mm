@@ -16,7 +16,7 @@
 
 #define VERSION_MAJOR   1
 #define VERSION_MINOR   0
-#define VERSION_PATCH   0
+#define VERSION_PATCH   1
 
 #define _STRINGIFY(x) #x
 #define STRINGIFY(x) _STRINGIFY(x)

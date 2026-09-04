@@ -5,6 +5,34 @@ independently — a release often touches one board and not the other, and eithe
 can be updated without the other, so in the field they legitimately differ.
 `/api/status` reports both (`fw` and `miner_fw`).
 
+## [1.0.1] - 2026-09-04 — mule only
+
+### Added
+- **Web flasher at <https://hms-homelab.github.io/hms-mm/>.** Flashes both boards from
+  Chrome or Edge with nothing installed, then collects the home WiFi and SD card
+  credentials in the browser and writes them to the mule over the same USB cable. The
+  `MM-Setup-XXXX` captive portal is unchanged and remains the fallback, and the only
+  route for a mule older than this release.
+- **USB provisioning listener on the mule** (`mule/main/serial_config.c`): newline JSON
+  over USB Serial/JTAG, `{"cmd":"ping"}` and `{"cmd":"provision",...}`, replies prefixed
+  `HMSMM ` so they can be picked out of `ESP_LOG` traffic on the same port. `ping`
+  reports the board's role, so a client cannot write credentials to the miner by mistake.
+- `.github/workflows/pages.yml` publishes the flasher against a release's own assets,
+  called explicitly from `release.yml` because a `GITHUB_TOKEN` release raises no
+  `release` event. `.github/scripts/build_flasher_manifests.py` writes the ESP Web Tools
+  manifests and reads them back to prove each names a firmware that exists and is a
+  plausible size, and `.github/scripts/test_flasher.py` drives the page against a fake
+  Web Serial mule so the provisioning flow is testable without hardware.
+
+### Fixed
+- **The merged images in v1.0.0 cannot boot.** `release.yml` merged the app at `0x10000`
+  and left `ota_data_initial.bin` out, offsets that were correct for the old single-
+  `factory` layout but not for the dual-OTA table that release introduced, where the app
+  lives at `0x20000`. Such an image flashes without complaint and then does nothing. The
+  merge now comes from the build's own `flash_args`, and the workflow asserts the app is
+  really present at the offset the partition table names before publishing anything.
+  **Re-flash from this release** if a v1.0.0 `-merged.bin` left a board dead.
+
 ## [1.0.0] - 2026-08-15
 
 ### Breaking — flash both boards together
