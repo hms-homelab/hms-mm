@@ -10,7 +10,16 @@
 # release assets without an Access-Control-Allow-Origin header, so a fetch()
 # from the Pages origin is blocked by the browser.
 #
-# Pages source must be set to "GitHub Actions" once, under Settings > Pages.
+# Two one-off settings this needs, both under Settings:
+#   * Pages > Source must be "GitHub Actions".
+#   * Environments > github-pages > deployment branches must allow the tag this
+#     runs on. release.yml calls this from a `v*` TAG, and the environment ships
+#     allowing the default branch only, so without a `v*` tag rule the job fails
+#     in two seconds with no steps run and the annotation "Tag ... is not allowed
+#     to deploy to github-pages due to environment protection rules".
+#     Added with:
+#       gh api -X POST repos/hms-homelab/hms-mm/environments/github-pages/deployment-branch-policies \
+#              -f name='v*' -f type=tag
 #
 # On triggers: release.yml calls this directly, because a release created with
 # GITHUB_TOKEN does NOT raise a `release` event that can start another workflow.
