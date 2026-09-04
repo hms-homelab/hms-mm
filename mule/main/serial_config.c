@@ -6,7 +6,7 @@
  * and answers on the same link. Two commands:
  *
  *   {"cmd":"ping"}
- *     -> HMSMM {"ok":true,"role":"mule","fw":"2026.0.5","serial":"MM-1A2B",
+ *     -> HMSMM {"ok":true,"role":"mule","fw":"1.0.1","serial":"MM-1A2B",
  *               "wifi":false,"ezshare":false}
  *
  *   {"cmd":"provision","ssid":"..","pass":"..","ez_ssid":"..","ez_pass":".."}

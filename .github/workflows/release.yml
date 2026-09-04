@@ -99,18 +99,14 @@ jobs:
             cp "$B/merged.bin" "dist/$board-$VER-merged.bin"
           done
 
-          # Prove the merged image really does carry the app at the offset the
-          # partition table names, so a wrong-offset image cannot ship again.
+          # Prove each merged image really does carry every part at the offset
+          # flash_args names, so a wrong-offset image cannot ship again. The
+          # first attempt at this check was inline shell; it passed locally and
+          # failed here for reasons the one-line output could not explain, which
+          # is exactly why it is a script that says what it compared.
           for board in mule miner; do
-            B="$board/build"
-            off=$(awk '$1 ~ /^0x/ && $2 ~ /hms-mm-/ {print $1}' "$B/flash_args")
-            skip=$(( off + 1 ))
-            if tail -c +$skip "$B/merged.bin" | head -c 64 | cmp -s - <(head -c 64 "$B/hms-mm-$board.bin"); then
-              echo "$board: app present at $off in the merged image"
-            else
-              echo "::error::$board merged image does not carry the app at $off"
-              exit 1
-            fi
+            echo "=== $board ==="
+            python3 .github/scripts/check_merged_image.py "$board/build"
           done
 
           (cd dist && sha256sum * > SHA256SUMS.txt)
