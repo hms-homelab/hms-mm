@@ -112,6 +112,17 @@ jobs:
           (cd dist && sha256sum * > SHA256SUMS.txt)
           ls -la dist
 
+      # Actually boot the images. The offset check above proves the bytes are
+      # in the right places; this proves the firmware starts, which is the thing
+      # v1.0.0 got wrong in a way that looked fine everywhere else.
+      - name: Boot both images in QEMU
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          for board in mule miner; do
+            python3 .github/scripts/qemu_boot_test.py "$board" "$board/build/merged.bin"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: firmware

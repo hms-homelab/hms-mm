@@ -32,6 +32,14 @@ can be updated without the other, so in the field they legitimately differ.
   merge now comes from the build's own `flash_args`, and the workflow asserts the app is
   really present at the offset the partition table names before publishing anything.
   **Re-flash from this release** if a v1.0.0 `-merged.bin` left a board dead.
+- **Releases are now boot-tested, not just byte-checked.** `.github/scripts/qemu_boot_test.py`
+  runs each merged image on an emulated ESP32-C3 and fails the release unless it reaches
+  that board's own `app_main`. Getting there meant fixing a hang nobody had chased: a
+  stock image under QEMU stops before `main_task` because, with no calibration in eFuse,
+  the `adc2_init_code_calibration()` global constructor self-calibrates the ADC by polling
+  a SAR ADC flag QEMU never raises. Supplying an eFuse image with `BLK_VERSION_MAJOR=1`
+  sends it down the read-from-eFuse path and it boots. IDF's own default eFuse blob does
+  not set that bit, so `idf.py qemu` hits this on any ESP32-C3 project.
 
 ## [1.0.0] - 2026-08-15
 

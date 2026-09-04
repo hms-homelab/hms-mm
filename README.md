@@ -405,6 +405,25 @@ board still publishes the other at its own version.
 To check the page without hardware, stage a site and run the browser test — the header of
 `.github/scripts/test_flasher.py` has the commands.
 
+### Boot test
+
+`release.yml` boots both merged images on an emulated ESP32-C3 before publishing, and
+fails the release unless each one reaches its own `app_main`:
+
+```bash
+python3 $IDF_PATH/tools/idf_tools.py install qemu-riscv32   # once
+python3 .github/scripts/qemu_boot_test.py mule  mule/build/merged.bin
+python3 .github/scripts/qemu_boot_test.py miner miner/build/merged.bin
+```
+
+A stock image under QEMU hangs before `app_main`, last line `eFuse: calibration efuse
+version does not match`. That warning is the cause: with no calibration in eFuse,
+`adc2_init_code_calibration()` — a global constructor, so it runs before `main_task` —
+self-calibrates the ADC by polling a SAR ADC flag QEMU never raises, and spins forever.
+The script supplies an eFuse image with `BLK_VERSION_MAJOR=1` so the firmware takes the
+read-from-eFuse path instead. The firmware is not modified for this; the blob stands in
+for calibration data real silicon ships with.
+
 ## 3D-Printed Board
 
 There is a 3D-printed "tape PCB" for this project in [`hardware/3d-pcb/`](hardware/3d-pcb/):
