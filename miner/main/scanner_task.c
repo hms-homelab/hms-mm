@@ -10,6 +10,8 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 #include "esp_rom_crc.h"
 #include "mbedtls/base64.h"
@@ -31,10 +33,14 @@ static scanner_state_t current_state = SCANNER_IDLE;
 static char ez_ssid[33] = {0};
 static char ez_pass[65] = {0};
 
-static int64_t last_proxy_time_us = 0;
-
-/* O2Ring BLE state */
+/* O2Ring BLE state. The stack and the ring link are held between requests;
+ * see release_ble() for everything that drops them. */
 static bool s_ble_initialized = false;
+static int64_t s_ble_last_use_us = 0;       /* last ring request served */
+static int64_t s_ble_backoff_until_us = 0;  /* no BLE attempt before this */
+/* Set from the WiFi event task when the ezShare link drops; the scanner frees
+ * the ring's stack on its next pass, so the reassociation gets the radio. */
+static volatile bool s_link_lost = false;
 static int o2ring_req_id = 0;
 static char o2ring_cmd[16] = {0};
 static char o2ring_filename[O2RING_MAX_FILENAME] = {0};
@@ -200,6 +206,7 @@ static esp_err_t proxy_chunk_callback(const uint8_t *data, size_t len,
                                        size_t seq, bool is_last, void *ctx)
 {
     proxy_ctx_t *pctx = (proxy_ctx_t *)ctx;
+    esp_task_wdt_reset();   /* hang guard: a long file is progress, not a hang */
 
     /* Stop early if the mule aborted this stream (HTTP client disconnected).
      * Returning an error unwinds ezshare_raw_get_range so we don't keep pulling
@@ -306,22 +313,48 @@ static void send_o2ring_live(int req_id)
 
 /* ── BLE management ──────────────────────────────────────────── */
 
+/* The one place the ring's stack comes down. Logs the heap before and after,
+ * because the whole point of dropping it is to give that heap back. */
+static void release_ble(const char *why)
+{
+    if (!s_ble_initialized) return;
+    ESP_LOGI(TAG, "dropping BLE: %s (free=%lu largest=%u)", why,
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    /* deinit alone: it closes the link, waits for the disconnect, then stops
+     * the host. Stopping first (o2ring_ble_stop) would race that. */
+    o2ring_ble_deinit();
+    s_ble_initialized = false;
+    ESP_LOGI(TAG, "BLE down (free=%lu largest=%u)",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+}
+
 static bool ensure_ble_ready(int req_id)
 {
-    /* BLE gate: off by default. Bringing up BLE drops the ezShare WiFi link
-     * (shared radio on the C3), interrupting CPAP collection — so don't touch the
-     * radio at all unless explicitly enabled via NVS miner/ble_active=1. */
+    /* BLE gate: off by default, NVS miner/ble_active=1 (o2_set_enabled) turns
+     * it on. When on, the ring and the ezShare link share the radio: the
+     * ezShare link is NOT dropped for BLE. The card is the device's purpose,
+     * and a card on an underpowered SD slot can fail a re-association outright. */
     if (!nvs_config_ble_active()) {
         ESP_LOGW(TAG, "O2Ring request but ble_active=0 — BLE disabled");
         send_error_json(req_id, "O2Ring BLE disabled", "BLE_DISABLED");
         return false;
     }
 
-    /* Disconnect WiFi if connected (radio shared on ESP32-C3) */
-    if (wifi_manager_is_connected()) {
-        ESP_LOGI(TAG, "Disconnecting WiFi for BLE");
-        wifi_manager_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(100));
+    /* The ezShare link is down and being retried: it gets the whole radio and
+     * the whole heap until it is back. The ring is the expendable one. */
+    if (!wifi_manager_is_connected() && wifi_manager_get_status() == WIFI_STATUS_CONNECTING) {
+        send_error_json(req_id, "ezShare link re-establishing; ring deferred", "BLE_DEFERRED");
+        return false;
+    }
+
+    /* A ring that was not found recently is not looked for again yet: bringing
+     * the stack up and down for every request costs the card heap and airtime
+     * for nothing. */
+    if (esp_timer_get_time() < s_ble_backoff_until_us) {
+        send_error_json(req_id, "O2Ring not found (recently)", "BLE_NOT_FOUND");
+        return false;
     }
 
     if (!s_ble_initialized) {
@@ -333,51 +366,49 @@ static bool ensure_ble_ready(int req_id)
         s_ble_initialized = true;
     }
 
+    /* Held link: reuse it when it is still up, so a live read pays no
+     * reconnect and no service discovery. */
     if (!o2ring_ble_is_connected()) {
         o2ring_ble_set_auto_reconnect(true);
         esp_err_t ret = o2ring_ble_connect_and_wait(O2RING_CONNECT_TIMEOUT_MS);
         if (ret != ESP_OK) {
+            /* A direct connect to a cached address that keeps failing means the
+             * ring was returned or re-paired: forget it and scan next time. */
+            if (o2ring_ble_forget_cached_if_direct())
+                ESP_LOGW(TAG, "forgot the cached ring address — next attempt scans");
+            release_ble("connect timeout");
+            s_ble_backoff_until_us = esp_timer_get_time() + (int64_t)O2RING_BACKOFF_MS * 1000;
             send_error_json(req_id, "O2Ring not found", "BLE_NOT_FOUND");
             return false;
         }
     }
+    s_ble_last_use_us = esp_timer_get_time();
     return true;
 }
 
-static void release_ble(void)
+/* ── The held links, looked after between requests ─────────────── */
+
+static void on_link_change(bool up)
 {
-    if (!s_ble_initialized) return;
-    o2ring_ble_stop();
-    o2ring_ble_deinit();
-    s_ble_initialized = false;
-    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!up) s_link_lost = true;   /* acted on by the scanner, not this event task */
 }
 
-/* ── WiFi management with idle timeout ─────────────────────────── */
-
-static bool ensure_ezshare_connected(void)
+/* Is the ezShare link up? Never waits: the link is held and retried in the
+ * background, so a request that finds it down is answered at once. */
+static bool ezshare_link_up(void)
 {
-    if (wifi_manager_is_connected()) return true;
+    return wifi_manager_is_connected();
+}
 
-    ESP_LOGI(TAG, "Connecting to ezShare (%s)...", ez_ssid);
-    if (wifi_manager_connect(ez_ssid, ez_pass, WIFI_CONNECT_TIMEOUT_MS) == ESP_OK) {
-        ezshare_client_init();
-        return true;
+static void look_after_ble(void)
+{
+    if (s_link_lost) {
+        s_link_lost = false;
+        release_ble("ezShare link lost, yielding the radio");
     }
-    ESP_LOGE(TAG, "ezShare WiFi connect failed");
-    return false;
-}
-
-static void check_idle_disconnect(void)
-{
-    if (!wifi_manager_is_connected()) return;
-    if (last_proxy_time_us == 0) return;
-
-    int64_t elapsed_ms = (esp_timer_get_time() - last_proxy_time_us) / 1000;
-    if (elapsed_ms > PROXY_IDLE_TIMEOUT_MS) {
-        ESP_LOGI(TAG, "Idle timeout — disconnecting from ezShare");
-        wifi_manager_disconnect();
-        last_proxy_time_us = 0;
+    if (s_ble_initialized &&
+        esp_timer_get_time() - s_ble_last_use_us > (int64_t)O2RING_LINK_IDLE_MS * 1000) {
+        release_ble("idle");
     }
 }
 
@@ -430,10 +461,16 @@ static void handle_set_config(cJSON *root)
 /* ── O2Ring streaming download ─────────────────────────────────── */
 
 typedef struct {
-    int    req_id;
-    size_t seq;
-    bool   failed;
+    int      req_id;
+    size_t   seq;
+    bool     failed;
+    uint32_t size;     /* what the ring reported at FILE_OPEN; 0 = not told */
 } o2_dl_ctx_t;
+
+static void o2_dl_size_cb(uint32_t file_size, void *ctx)
+{
+    ((o2_dl_ctx_t *)ctx)->size = file_size;
+}
 
 /* One BLE block, straight onto the link. Returning false unwinds the download
  * inside o2ring_ble, so a link that has stopped accepting frames stops the
@@ -649,10 +686,15 @@ static void scanner_task_loop(void *pvParameters)
 {
     char uart_buf[JSON_BUFFER_SIZE];
 
+    /* Hang guard: every wait below is bounded well under the watchdog, so a
+     * scanner that stops feeding it is stuck. */
+    esp_task_wdt_add(NULL);
+
     while (task_running) {
+        esp_task_wdt_reset();
         switch (current_state) {
             case SCANNER_IDLE: {
-                check_idle_disconnect();
+                look_after_ble();
                 /* Roll back if a freshly written image has run out of time to
                  * show it can still hear the mule. */
                 miner_ota_check_rollback_deadline();
@@ -734,11 +776,18 @@ static void scanner_task_loop(void *pvParameters)
             }
 
             case SCANNER_PROXY: {
-                release_ble();  /* Free BLE heap before WiFi */
+                /* The card owns the heap. With the ring's stack and link up,
+                 * a held ezShare link leaves too little for the card's own
+                 * burst (the HTTP client and its buffers need nearly all of
+                 * it), and no threshold makes both fit. So the stack is
+                 * dropped before EVERY card transfer; the next ring request
+                 * brings it back and pays one reconnect. */
+                release_ble("yielding heap to the card");
 
-                if (!ensure_ezshare_connected()) {
+                if (!ezshare_link_up()) {
+                    /* Answered at once; the background schedule keeps trying. */
                     send_error_json(proxy_req_id, "ezShare unreachable", "WIFI_FAILED");
-                    current_state = SCANNER_ERROR;
+                    current_state = SCANNER_IDLE;
                     break;
                 }
 
@@ -752,11 +801,22 @@ static void scanner_task_loop(void *pvParameters)
                     .error = false,
                 };
 
-                esp_err_t err = ezshare_raw_get_range(
-                    proxy_path, FILE_CHUNK_SIZE,
-                    proxy_range_start, proxy_range_end,
-                    &pctx.http_status, &pctx.content_length,
-                    proxy_chunk_callback, &pctx);
+                esp_err_t err;
+                if (strstr(proxy_path, "dir?") != NULL) {
+                    /* A listing: checked before anything is forwarded, so a
+                     * card that answers with its index page is asked again
+                     * rather than reported as empty. */
+                    err = ezshare_stream_listing(
+                        proxy_path, FILE_CHUNK_SIZE,
+                        &pctx.http_status, &pctx.content_length,
+                        proxy_chunk_callback, &pctx);
+                } else {
+                    err = ezshare_raw_get_range(
+                        proxy_path, FILE_CHUNK_SIZE,
+                        proxy_range_start, proxy_range_end,
+                        &pctx.http_status, &pctx.content_length,
+                        proxy_chunk_callback, &pctx);
+                }
 
                 if (pctx.aborted) {
                     /* Client gone — mule already abandoned the response. Stay
@@ -769,7 +829,6 @@ static void scanner_task_loop(void *pvParameters)
                         send_error_json(proxy_req_id, "ezShare request failed", "HTTP_FAILED");
                 }
 
-                last_proxy_time_us = esp_timer_get_time();
                 current_state = SCANNER_IDLE;
                 break;
             }
@@ -821,10 +880,20 @@ static void scanner_task_loop(void *pvParameters)
                      * end marker. */
                     send_proxy_meta(o2ring_req_id, 200, 0, 0);
 
-                    o2_dl_ctx_t dctx = { .req_id = o2ring_req_id, .seq = 0, .failed = false };
+                    o2_dl_ctx_t dctx = { .req_id = o2ring_req_id, .seq = 0, .failed = false,
+                                         .size = 0 };
                     size_t out_len = 0;
                     esp_err_t ret = o2ring_ble_download_file_stream(
-                        o2ring_filename, o2_dl_chunk_cb, &dctx, &out_len);
+                        o2ring_filename, o2_dl_size_cb, o2_dl_chunk_cb, &dctx, &out_len);
+
+                    /* The ring said how big the file is before the first
+                     * block; fewer bytes than that is a truncated file, which
+                     * must not reach the client as a complete one. */
+                    if (ret == ESP_OK && dctx.size && out_len < dctx.size) {
+                        ESP_LOGE(TAG, "O2Ring download short: %u of %u bytes",
+                                 (unsigned)out_len, (unsigned)dctx.size);
+                        ret = ESP_ERR_INVALID_SIZE;
+                    }
 
                     if (ret != ESP_OK || dctx.failed || out_len == 0) {
                         /* Chunks may already be on the wire, so the mule has to
@@ -849,15 +918,20 @@ static void scanner_task_loop(void *pvParameters)
             }
 
             case SCANNER_OTA: {
-                /* The gate: while an image is being written, only OTA frames
-                 * are honoured. Anything else is refused rather than ignored,
-                 * so a client that asks for a file mid-update gets an error it
-                 * can act on instead of a silence it has to time out.
+                /* While an image is being written, only OTA frames keep the
+                 * update alive. The mule holds the link lock for the whole
+                 * update, so any other frame means it has already given up on
+                 * it (its own transfer failed, or it restarted) and gone back
+                 * to serving. Refusing such frames with OTA_BUSY while each one
+                 * reset the silence timer below held the miner in this state
+                 * for as long as the mule kept asking: an unreachable card
+                 * until something rebooted it. So: abort, answer the request
+                 * with an error its sender can retry, and serve again.
                  *
-                 * The timeout is generous because the mule pauses between
-                 * chunks to read its own source (HTTP body or network), but it
-                 * is not unbounded: a mule that dies mid-transfer must not
-                 * leave the miner stuck here forever. */
+                 * The silence timeout is generous because the mule pauses
+                 * between chunks to read its own source (HTTP body or network),
+                 * but it is not unbounded: a mule that dies mid-transfer must
+                 * not leave the miner stuck here forever. */
                 int len = uart_receive_json(uart_buf, sizeof(uart_buf), 30000);
                 if (len <= 0) {
                     ESP_LOGE(TAG, "OTA: no frame from the mule — abandoning");
@@ -881,9 +955,13 @@ static void scanner_task_loop(void *pvParameters)
                     send_ack("ota_abort");
                     current_state = SCANNER_IDLE;
                 } else {
-                    ESP_LOGW(TAG, "'%s' refused: a firmware update is in progress",
-                             type->valuestring);
-                    send_error_json(0, "firmware update in progress", "OTA_BUSY");
+                    ESP_LOGE(TAG, "OTA: mule sent '%s' mid-update -- it abandoned the "
+                                  "update; aborting and serving again", type->valuestring);
+                    miner_ota_abort();
+                    cJSON *id_j = cJSON_GetObjectItem(root, "id");
+                    send_error_json(cJSON_IsNumber(id_j) ? id_j->valueint : 0,
+                                    "firmware update abandoned; ask again", "OTA_ABANDONED");
+                    current_state = SCANNER_IDLE;
                 }
                 cJSON_Delete(root);
                 break;
@@ -909,6 +987,30 @@ esp_err_t scanner_task_init(void)
 esp_err_t scanner_task_start(void)
 {
     if (task_running) return ESP_OK;
+
+    /* Hang guard, see SCANNER_HANG_TIMEOUT_S. The idle-task checks stay on
+     * the cores sdkconfig chose. */
+    uint32_t idle_mask = 0;
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+    idle_mask |= 1u << 0;
+#endif
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+    idle_mask |= 1u << 1;
+#endif
+    esp_task_wdt_config_t wdt = {
+        .timeout_ms     = SCANNER_HANG_TIMEOUT_S * 1000,
+        .idle_core_mask = idle_mask,
+        .trigger_panic  = true,
+    };
+    if (esp_task_wdt_reconfigure(&wdt) != ESP_OK && esp_task_wdt_init(&wdt) != ESP_OK)
+        ESP_LOGE(TAG, "hang guard: task watchdog could not be configured");
+
+    /* Hold the ezShare link from boot. Power save off only while the ring is
+     * off: ESP-IDF requires modem sleep while Bluetooth is enabled. */
+    wifi_manager_set_power_save(!nvs_config_ble_active());
+    wifi_manager_set_link_cb(on_link_change);
+    wifi_manager_start(ez_ssid, ez_pass);
+
     task_running = true;
     if (xTaskCreate(scanner_task_loop, "miner_task", SCANNER_TASK_STACK_SIZE,
                     NULL, SCANNER_TASK_PRIORITY, &scanner_task_handle) != pdPASS) {

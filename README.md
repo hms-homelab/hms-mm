@@ -141,6 +141,19 @@ idf.py build
 idf.py -p /dev/cu.usbmodemYYYY flash
 ```
 
+**Boards.** The chip is the build target, and the board follows from it
+(`idf.py menuconfig` → *hms-mm board*):
+
+| Target | Board | UART (TX / RX) | WiFi TX power |
+|---|---|---|---|
+| `esp32c3` | ESP32-C3 SuperMini | mule 2 / 3, miner 2 / 3 (crossed by the tape board) | 11 dBm, for its antenna |
+| `esp32s3` | M5Stack AtomS3 | mule 2 / 1, miner 1 / 2 | 20 dBm, the radio default |
+
+Build both boards of a pair for the same target. Releases publish both: the
+AtomS3 images carry `-atom-s3` in their names, and the web flasher picks the
+right one for the chip it finds. AtomS3 support started from a patch by
+@ghulands (issue #2).
+
 ### 4. Configure WiFi (Captive Portal or USB)
 
 The [web flasher](#install) does this over USB and is the easier route. The captive

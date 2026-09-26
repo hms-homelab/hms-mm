@@ -1,0 +1,27 @@
+menu "hms-mm board"
+
+    choice HMS_MM_BOARD
+        prompt "Board"
+        default HMS_MM_BOARD_C3_SUPERMINI if IDF_TARGET_ESP32C3
+        default HMS_MM_BOARD_ATOM_S3 if IDF_TARGET_ESP32S3
+        help
+            Which board this image runs on. It sets the UART pins to the other
+            board and the WiFi transmit power. The chip itself is the build
+            target: idf.py set-target esp32c3 or esp32s3. The mule and the
+            miner of a pair must be built for the same board.
+
+        config HMS_MM_BOARD_C3_SUPERMINI
+            bool "ESP32-C3 SuperMini (UART on GPIO2/3)"
+            depends on IDF_TARGET_ESP32C3
+
+        config HMS_MM_BOARD_ATOM_S3
+            bool "M5Stack AtomS3 (ESP32-S3, UART on GPIO2/1)"
+            depends on IDF_TARGET_ESP32S3
+    endchoice
+
+    config HMS_MM_BOARD_NAME
+        string
+        default "c3-supermini" if HMS_MM_BOARD_C3_SUPERMINI
+        default "atom-s3" if HMS_MM_BOARD_ATOM_S3
+
+endmenu

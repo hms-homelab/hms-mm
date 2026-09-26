@@ -7,7 +7,8 @@ idf_component_register(
         "scanner_task.c"
         "nvs_config.c"
         "crash_guard.c"
-        "o2ring_ble.c"
+        "ez_retry.c"
+        "o2ring_ble_nimble.c"
         "ota_handler.c"
     INCLUDE_DIRS "."
     REQUIRES

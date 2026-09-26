@@ -60,6 +60,19 @@ esp_err_t ezshare_raw_get_range(const char *path, size_t chunk_size,
 esp_err_t ezshare_raw_get(const char *path, size_t chunk_size,
                            raw_chunk_callback_t callback, void *ctx);
 
+/**
+ * @brief A "/dir?..." request, streamed like ezshare_raw_get_range, but the
+ *        first chunk must be a real listing before anything is forwarded.
+ *
+ * Some cards now and then answer with their index page instead; that attempt
+ * is dropped unforwarded and asked again (EZSHARE_LIST_RETRIES times,
+ * EZSHARE_LIST_RETRY_MS apart). ESP_FAIL if every attempt got the index page.
+ */
+esp_err_t ezshare_stream_listing(const char *path, size_t chunk_size,
+                                 uint16_t *out_http_status,
+                                 uint32_t *out_content_length,
+                                 raw_chunk_callback_t callback, void *ctx);
+
 esp_err_t ezshare_file_list_init(ezshare_file_list_t *file_list, size_t initial_capacity);
 esp_err_t ezshare_file_list_add(ezshare_file_list_t *file_list, const ezshare_file_t *file);
 void ezshare_file_list_free(ezshare_file_list_t *file_list);

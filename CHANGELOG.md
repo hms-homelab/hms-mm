@@ -5,6 +5,63 @@ independently — a release often touches one board and not the other, and eithe
 can be updated without the other, so in the field they legitimately differ.
 `/api/status` reports both (`fw` and `miner_fw`).
 
+## [1.1.0] - unreleased — miner 1.1.0, mule 1.1.0
+
+### Changed — the miner holds its connections
+- **The ezShare link is joined at boot and held.** It is no longer joined per
+  request and dropped after five idle minutes. Every failed join and every drop
+  is retried in the background, 5 s apart ten times, then doubling to a 5 minute
+  ceiling, and it never gives up; a request never waits for a join, it is
+  answered at once. Before, a card that was off at boot got five immediate tries
+  and then an error, and every request after that re-ran them: a card on an
+  underpowered SD slot was one failed re-association away from lost.
+- **The O2 ring shares the radio with the card instead of taking it.** Asking
+  for a ring reading used to disconnect the ezShare link. Now the ring's BLE
+  link is held beside it, so a second live read costs no reconnect and no
+  service discovery (on the bench, 1.8 s for the first read, 150 ms after). The
+  ring gives way whenever the card needs room: its stack is dropped before every
+  card transfer (tens of ms, heap back to ~100 KB), when the ezShare link drops,
+  and after three minutes without a ring request. A ring that is not found is
+  not looked for again for 30 s.
+- **NimBLE replaces Bluedroid** for the ring, trimmed to one central
+  connection. Bluedroid's footprint is why a held card link and the ring did not
+  fit in the heap together. Bench, card joined and ring connected: 46-49 KB free.
+- **Power save off on the mule**, and on the miner while the ring is disabled
+  (ESP-IDF requires modem sleep while Bluetooth is on). Modem sleep made the
+  mule answer late or not at all on a busy network, and made the card drop
+  unicast to a sleeping miner.
+
+### Added
+- **M5Stack AtomS3 (ESP32-S3) as a board option**, from @ghulands's patch in
+  issue #2: build with `idf.py set-target esp32s3`. Pins and TX power per board
+  (README, *Boards*). Releases publish both chips; one flasher button per board
+  serves either chip.
+- **More rings are recognised**: Checkme O2 / O2 Ultra (which advertises as
+  "Band-WU"), SleepU, Oxyring and other Viatom / Wellue models, by name or by
+  the family's service UUID. Before, only names containing "O2Ring".
+- **Hang guard**: the miner's request task is on the task watchdog (150 s,
+  above its longest bounded wait); a hung miner restarts itself instead of
+  waiting for someone to power-cycle it.
+
+### Fixed
+- **A card path with a space failed**, e.g. `A:System Volume Information`:
+  spaces were not encoded, and the HTTP client refuses such a URL.
+- **A listing the card answers with its index page** is asked again (three
+  times, 400 ms apart) rather than served as an empty card. An empty folder,
+  which has no links at all, is still recognised as a listing.
+- **A miner could stay stuck in a firmware update** the mule had given up on:
+  each request the mule sent reset the update's silence timer and was refused
+  as "update in progress", so the card was unreachable until a reboot. A
+  non-update frame now ends the update (the mule holds the link for the whole
+  of a real one) and gets an error its sender can retry.
+- **Every ring disconnect cost ~2 s** and a little heap: deinit terminated the
+  link and stopped the BLE host at once, racing the host's own terminate. It
+  now waits for the disconnect first.
+- **A ring download shorter than the size the ring reported** is refused
+  rather than served as a complete file.
+- The card's socket timeout is 15 s (was 30 s): a trickling or blackholed
+  connection now fails and is retried instead of wedging the miner.
+
 ## [1.0.1] - 2026-09-04 — mule only
 
 ### Added

@@ -49,11 +49,17 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
+/* Escapes only backslash and space. Everything else, '%' included, passes
+ * through, because callers hand this a whole path+query ("/dir?dir=A:System
+ * Volume Information") that may already be partly encoded, and '/', '?', '='
+ * and ':' must stay separators. Spaces matter: card folders carry them, and
+ * esp_http_client refuses a URL with a raw space outright. */
 static void url_encode_path(const char *src, char *dst, size_t dst_size) {
     char *d = dst;
     const char *end = dst + dst_size - 4;
     while (*src && d < end) {
-        if (*src == '\\') { *d++ = '%'; *d++ = '5'; *d++ = 'C'; }
+        if (*src == '\\')     { *d++ = '%'; *d++ = '5'; *d++ = 'C'; }
+        else if (*src == ' ') { *d++ = '%'; *d++ = '2'; *d++ = '0'; }
         else { *d++ = *src; }
         src++;
     }
@@ -188,8 +194,10 @@ esp_err_t ezshare_raw_get_range(const char *path, size_t chunk_size,
     if (!ezshare_initialized || !path || !callback || chunk_size == 0)
         return ESP_ERR_INVALID_ARG;
 
-    char url[512];
-    snprintf(url, sizeof(url), "http://%s:%d%s", EZSHARE_IP, EZSHARE_PORT, path);
+    static char encoded[600];   /* static: this runs on the scanner's 8 KB stack */
+    url_encode_path(path, encoded, sizeof(encoded));
+    static char url[700];
+    snprintf(url, sizeof(url), "http://%s:%d%s", EZSHARE_IP, EZSHARE_PORT, encoded);
 
     uint8_t *chunk_buf = malloc(chunk_size);
     if (!chunk_buf) return ESP_ERR_NO_MEM;
@@ -272,6 +280,80 @@ esp_err_t ezshare_raw_get_range(const char *path, size_t chunk_size,
 esp_err_t ezshare_raw_get(const char *path, size_t chunk_size,
                            raw_chunk_callback_t callback, void *ctx) {
     return ezshare_raw_get_range(path, chunk_size, 0, 0, NULL, NULL, callback, ctx);
+}
+
+/* ── Directory listings, validated ─────────────────────────────── */
+
+static bool contains(const uint8_t *buf, size_t len, const char *needle) {
+    const size_t n = strlen(needle);
+    for (size_t i = 0; i + n <= len; i++) {
+        if (memcmp(buf + i, needle, n) == 0) return true;
+    }
+    return false;
+}
+
+/* Some cards now and then answer a /dir request with their index page, a 200
+ * that looks like a listing with no folders in it. Served as-is, the client
+ * concludes the card is empty. A real listing links its entries ("dir?dir=");
+ * an EMPTY folder can carry no link at all (no "." or ".." either), but still
+ * has the listing page's own heading and entry count, which the index page
+ * has neither of. */
+static bool html_is_listing(const uint8_t *buf, size_t len) {
+    if (!buf || len < 8) return false;
+    return contains(buf, len, "dir?dir=") ||
+           contains(buf, len, "Directory Index of") ||
+           contains(buf, len, "Total Entries:");
+}
+
+typedef struct {
+    raw_chunk_callback_t real_cb;
+    void *real_ctx;
+    bool first_seen;
+    bool invalid;
+} listing_ctx_t;
+
+/* Checks the FIRST chunk before anything is forwarded, so a rejected attempt
+ * sends the mule nothing and the retry can still answer cleanly. */
+static esp_err_t listing_validating_cb(const uint8_t *data, size_t len,
+                                       size_t seq, bool is_last, void *ctx)
+{
+    listing_ctx_t *lc = (listing_ctx_t *)ctx;
+    if (!lc->first_seen) {
+        lc->first_seen = true;
+        if (!html_is_listing(data, len)) {
+            lc->invalid = true;
+            return ESP_FAIL;   /* abort this attempt; the caller retries */
+        }
+    }
+    return lc->real_cb(data, len, seq, is_last, lc->real_ctx);
+}
+
+esp_err_t ezshare_stream_listing(const char *path, size_t chunk_size,
+                                 uint16_t *out_http_status,
+                                 uint32_t *out_content_length,
+                                 raw_chunk_callback_t callback, void *ctx)
+{
+    if (!ezshare_initialized || !path || !callback || chunk_size == 0)
+        return ESP_ERR_INVALID_ARG;
+
+    esp_err_t result = ESP_FAIL;
+    for (int attempt = 1; attempt <= EZSHARE_LIST_RETRIES; attempt++) {
+        listing_ctx_t lc = { .real_cb = callback, .real_ctx = ctx,
+                             .first_seen = false, .invalid = false };
+        result = ezshare_raw_get_range(path, chunk_size, 0, 0,
+                                       out_http_status, out_content_length,
+                                       listing_validating_cb, &lc);
+        /* A real listing, or a hard HTTP/transport error: done. Only the
+         * index-page answer is worth asking again. */
+        if (!lc.invalid) return result;
+
+        ESP_LOGW(TAG, "listing attempt %d/%d: the card answered its index page%s",
+                 attempt, EZSHARE_LIST_RETRIES,
+                 attempt < EZSHARE_LIST_RETRIES ? " -- retrying" : " -- giving up");
+        if (attempt < EZSHARE_LIST_RETRIES)
+            vTaskDelay(pdMS_TO_TICKS(EZSHARE_LIST_RETRY_MS));
+    }
+    return ESP_FAIL;   /* every attempt returned the index page */
 }
 
 /* ── File list helpers ─────────────────────────────────────────── */

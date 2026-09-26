@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sdkconfig.h"   /* CONFIG_HMS_MM_BOARD_* */
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
@@ -12,10 +13,28 @@
 // Home WiFi defaults (overridden by NVS if captive portal was used)
 #define HOME_WIFI_SSID_DEFAULT      "your_wifi_ssid"
 #define HOME_WIFI_PASSWORD_DEFAULT  "your_wifi_password"
-// Max radio transmit power, in quarter-dBm. 44 = 11 dBm. NOT a power saving:
-// the C3 SuperMini PCB antenna distorts at the ~20 dBm default, so turning it
-// down makes the device INTELLIGIBLE, not quieter.
+// Board (Kconfig "hms-mm board", chosen by the build target).
+//
+// WIFI_TX_POWER_QDBM: max radio transmit power, in quarter-dBm. On the C3
+// SuperMini, 44 (11 dBm) is NOT a power saving: its PCB antenna distorts at
+// the ~20 dBm default, so turning it down makes the device INTELLIGIBLE, not
+// quieter. It is a workaround for that one antenna. On any other board it just
+// yields a link too weak for unicast rates (broadcast still works, so the
+// symptom is a device that joins, gets DHCP and answers mDNS but never a ping),
+// so other boards run the radio default.
+//
+// UART: C3 SuperMini TX=GPIO2, RX=GPIO3 on both boards (the tape board does
+// the crossover). AtomS3: mule TX=GPIO2, RX=GPIO1; the miner is the other way
+// round.
+#if defined(CONFIG_HMS_MM_BOARD_ATOM_S3)
+#define WIFI_TX_POWER_QDBM          80      // 20 dBm, the radio default
+#define UART_TX_PIN                 GPIO_NUM_2
+#define UART_RX_PIN                 GPIO_NUM_1
+#else   // CONFIG_HMS_MM_BOARD_C3_SUPERMINI
 #define WIFI_TX_POWER_QDBM          44
+#define UART_TX_PIN                 GPIO_NUM_2
+#define UART_RX_PIN                 GPIO_NUM_3
+#endif
 
 #define WIFI_MAXIMUM_RETRY          5
 #define WIFI_CONNECT_TIMEOUT_MS     15000
@@ -53,8 +72,6 @@
 // shows chunk CRC mismatches, lower it. Both boards must match, so changing it
 // means reflashing the pair.
 #define UART_BAUD_RATE              460800
-#define UART_TX_PIN                 GPIO_NUM_2
-#define UART_RX_PIN                 GPIO_NUM_3
 // 32 KB, deliberately larger than the miner's. This is the direction the bulk
 // data flows, and the httpd task must base64-decode, CRC and push each chunk
 // over WiFi before it reads again — so any WiFi stall has to be absorbed here.

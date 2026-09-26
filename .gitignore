@@ -1,6 +1,11 @@
 build/
+build-*/
 sdkconfig
 sdkconfig.old
+# Per-chip configs from `idf.py -D SDKCONFIG=sdkconfig.<target>`. Named
+# exactly, so sdkconfig.defaults and sdkconfig.defaults.<target> stay tracked.
+sdkconfig.esp32c3
+sdkconfig.esp32s3
 dependencies.lock
 managed_components/
 .vscode/

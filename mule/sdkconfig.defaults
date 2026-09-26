@@ -1,4 +1,6 @@
-CONFIG_IDF_TARGET="esp32c3"
+# The chip is the build target, not a default: idf.py set-target esp32c3 (C3
+# SuperMini) or esp32s3 (M5Stack AtomS3). Chip-only settings live in
+# sdkconfig.defaults.<target>, which ESP-IDF applies on top of this file.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

@@ -1,0 +1,7 @@
+# M5Stack AtomS3 (idf.py set-target esp32s3). Applied on top of
+# sdkconfig.defaults. The board's pins and transmit power follow from the
+# "hms-mm board" Kconfig choice, which defaults to the AtomS3 on this target.
+
+# The S3's WiFi event handling needs a deeper system event task stack than the
+# C3's default.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=8192

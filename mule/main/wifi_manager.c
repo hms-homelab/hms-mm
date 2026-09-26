@@ -215,12 +215,22 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password, uint32_t 
         s_started = true;
     }
 
-    /* ~11 dBm. The C3 SuperMini's PCB antenna cannot take the default ~20 dBm:
-     * driven that hard the output distorts, and the symptom is not "weak" but
-     * "unintelligible" — the chip hears everything and nothing can decode what
-     * it sends. In STA that looks like reaching auth and then AUTH_EXPIRE; in
-     * AP mode it looks like beacons that no device on the bench can see. */
+    /* Per board (config.h). On the C3 SuperMini, ~11 dBm: its PCB antenna
+     * cannot take the default ~20 dBm; driven that hard the output distorts,
+     * and the symptom is not "weak" but "unintelligible" — the chip hears
+     * everything and nothing can decode what it sends. In STA that looks like
+     * reaching auth and then AUTH_EXPIRE; in AP mode it looks like beacons that
+     * no device on the bench can see. */
     esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+
+    /* This board is a mains-powered HTTP server: it must answer an unsolicited
+     * request now, not at the next listen interval. The default modem sleep
+     * has the AP buffer unicast for a sleeping station, which on a busy
+     * network shows up as multi-second ping times degrading to total loss,
+     * while the device's own outbound traffic (DHCP, mDNS) keeps working, so it
+     * looks associated and healthy from the console while being unreachable.
+     * The mule runs no Bluetooth, so nothing here needs modem sleep. */
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     EventBits_t bits = xEventGroupWaitBits(s_event_group,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,

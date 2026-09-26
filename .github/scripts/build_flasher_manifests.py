@@ -34,16 +34,22 @@ BOARDS = {
 
 MERGED = re.compile(r"^(mule|miner)-(\d+\.\d+\.\d+)-merged\.bin$")
 
+# The AtomS3 images of the same release. One manifest carries both chips, and
+# ESP Web Tools flashes the build whose chipFamily matches the board it finds,
+# so there is still one button per board. Optional: a release from before the
+# S3 option has none, and its manifests stay C3-only.
+MERGED_S3 = re.compile(r"^(mule|miner)-(\d+\.\d+\.\d+)-atom-s3-merged\.bin$")
+
 # A merged ESP32-C3 image is ~1MB. Anything far below that is a truncated
 # download or an error page saved under a .bin name.
 MIN_PLAUSIBLE_BYTES = 500_000
 
 
-def find_images(firmware_dir: Path) -> dict[str, tuple[str, str]]:
+def find_images(firmware_dir: Path, pattern: re.Pattern = MERGED) -> dict[str, tuple[str, str]]:
     """board -> (filename, version), from whatever merged images are present."""
     found: dict[str, tuple[str, str]] = {}
     for path in sorted(firmware_dir.iterdir()):
-        match = MERGED.match(path.name)
+        match = pattern.match(path.name)
         if match:
             found[match.group(1)] = (path.name, match.group(2))
     return found
@@ -66,18 +72,30 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
+    images_s3 = find_images(firmware_dir, MERGED_S3)
+
     for board, label in BOARDS.items():
         filename, version = images[board]
+        builds = [
+            {
+                "chipFamily": "ESP32-C3",
+                "parts": [{"path": filename, "offset": 0}],
+            }
+        ]
+        if board in images_s3:
+            s3_file, s3_version = images_s3[board]
+            if s3_version != version:
+                print(f"::error::{board}: C3 image is {version} but AtomS3 image is {s3_version}")
+                return 1
+            builds.append({
+                "chipFamily": "ESP32-S3",
+                "parts": [{"path": s3_file, "offset": 0}],
+            })
         manifest = {
             "name": label,
             "version": version,
             "new_install_prompt_erase": True,
-            "builds": [
-                {
-                    "chipFamily": "ESP32-C3",
-                    "parts": [{"path": filename, "offset": 0}],
-                }
-            ],
+            "builds": builds,
         }
         path = firmware_dir / f"manifest-{board}.json"
         path.write_text(json.dumps(manifest, indent=2) + "\n")

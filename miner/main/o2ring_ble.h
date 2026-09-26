@@ -1,10 +1,11 @@
 /**
  * @file o2ring_ble.h
- * @brief Wellue O2 Ring BLE GATT client
+ * @brief Wellue / Viatom O2 ring BLE GATT client (NimBLE, o2ring_ble_nimble.c)
  *
- * Two modes of operation:
- * - Persistent connection: scan/connect once, stay connected for file ops
- * - Poll cycle: connect → read sensors → disconnect → sleep (for live data)
+ * The link is held between requests: scan or direct-connect once, discover
+ * once, then every live read or file request reuses it. The scanner drops the
+ * whole stack before each card transfer, after an idle spell, and when the
+ * card link is lost (scanner_task.c), so holding it never costs the card.
  */
 
 #ifndef O2RING_BLE_H
@@ -44,7 +45,17 @@ void o2ring_ble_deinit(void);
 esp_err_t o2ring_ble_start_scan(void);
 esp_err_t o2ring_ble_stop(void);
 esp_err_t o2ring_ble_disconnect(void);
+/* True when connected AND notifications are enabled: commands can be sent now,
+ * without reconnecting or re-discovering. */
 bool o2ring_ble_is_connected(void);
+
+/**
+ * After a connect timeout: if the attempt was a direct connect to the cached
+ * ring address, count it, and after three in a row forget the address so the
+ * next attempt scans again (a returned or re-paired ring). Returns true when it
+ * forgot. A timeout that followed a scan says nothing about the cache.
+ */
+bool o2ring_ble_forget_cached_if_direct(void);
 
 /** Control auto-reconnect after BLE disconnect. Default: true. */
 void o2ring_ble_set_auto_reconnect(bool enable);
@@ -84,11 +95,17 @@ esp_err_t o2ring_ble_download_file(const char *filename,
 typedef bool (*o2ring_chunk_cb_t)(const uint8_t *data, size_t len,
                                    uint32_t offset, void *ctx);
 
+/** Fired once, after FILE_OPEN succeeds and before the first chunk, with the
+ * size the ring reported, so the caller can check the streamed byte count. */
+typedef void (*o2ring_size_cb_t)(uint32_t file_size, void *ctx);
+
 /**
  * Download a .vld file, streaming each BLE block through a callback.
  * No buffer needed — each block fires the callback immediately.
+ * size_cb may be NULL.
  */
 esp_err_t o2ring_ble_download_file_stream(const char *filename,
+                                           o2ring_size_cb_t size_cb,
                                            o2ring_chunk_cb_t cb, void *ctx,
                                            size_t *out_len);
 

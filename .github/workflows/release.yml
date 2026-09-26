@@ -58,13 +58,22 @@ jobs:
             exit 1
           fi
 
-      - name: Build mule and miner
+      # Every board for every supported chip. The chip is the build target; the
+      # "hms-mm board" Kconfig choice follows it (C3 SuperMini on esp32c3,
+      # M5Stack AtomS3 on esp32s3), which sets the UART pins and TX power.
+      # Separate build dirs and sdkconfig files per chip, so neither build
+      # inherits the other's configuration.
+      - name: Build mule and miner, for each chip
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
-          for board in mule miner; do
-            echo "=== building $board ==="
-            (cd "$board" && idf.py set-target esp32c3 && idf.py build)
+          for target in esp32c3 esp32s3; do
+            for board in mule miner; do
+              echo "=== building $board for $target ==="
+              (cd "$board" &&
+                idf.py -B "build-$target" -D SDKCONFIG="sdkconfig.$target" set-target "$target" &&
+                idf.py -B "build-$target" -D SDKCONFIG="sdkconfig.$target" build)
+            done
           done
 
       # Two artefacts per board: the app image on its own (what /api/ota and
@@ -78,25 +87,37 @@ jobs:
         run: |
           . "$IDF_PATH/export.sh"
           mkdir -p dist
-          for board in mule miner; do
-            # Each artefact is named for ITS OWN board's version, not the tag —
-            # a release that bumps only one board still publishes both, and the
-            # filenames say plainly which is which.
-            case "$board" in
-              mule)  VER="$MULE_VER"  ;;
-              miner) VER="$MINER_VER" ;;
+          for target in esp32c3 esp32s3; do
+            # C3 SuperMini images keep their original names (the flasher and
+            # every guide point at them); AtomS3 images carry "-atom-s3". An
+            # image for the other chip is refused by the ESP32 bootloader and
+            # by the OTA write, so a mix-up fails loudly rather than bricks.
+            case "$target" in
+              esp32c3) SUFFIX=""        ;;
+              esp32s3) SUFFIX="-atom-s3" ;;
             esac
-            B="$board/build"
-            cp "$B/hms-mm-$board.bin"                   "dist/$board-$VER.bin"
-            cp "$B/bootloader/bootloader.bin"           "dist/$board-$VER-bootloader.bin"
-            cp "$B/partition_table/partition-table.bin" "dist/$board-$VER-partitions.bin"
-            # Merge from the build's own flash_args rather than offsets written
-            # out here. Hardcoded offsets went stale the moment partitions.csv
-            # moved to dual OTA: the app is at 0x20000 now, not 0x10000, and
-            # otadata at 0xf000 has to be in the image too. A merged image with
-            # the old offsets flashes without complaint and then does not boot.
-            ( cd "$B" && esptool.py --chip esp32c3 merge_bin -o merged.bin @flash_args )
-            cp "$B/merged.bin" "dist/$board-$VER-merged.bin"
+            for board in mule miner; do
+              # Each artefact is named for ITS OWN board's version, not the
+              # tag — a release that bumps only one board still publishes both,
+              # and the filenames say plainly which is which.
+              case "$board" in
+                mule)  VER="$MULE_VER"  ;;
+                miner) VER="$MINER_VER" ;;
+              esac
+              B="$board/build-$target"
+              N="$board-$VER$SUFFIX"
+              cp "$B/hms-mm-$board.bin"                   "dist/$N.bin"
+              cp "$B/bootloader/bootloader.bin"           "dist/$N-bootloader.bin"
+              cp "$B/partition_table/partition-table.bin" "dist/$N-partitions.bin"
+              # Merge from the build's own flash_args rather than offsets
+              # written out here. Hardcoded offsets went stale the moment
+              # partitions.csv moved to dual OTA: the app is at 0x20000 now,
+              # not 0x10000, and otadata at 0xf000 has to be in the image too.
+              # A merged image with the old offsets flashes without complaint
+              # and then does not boot.
+              ( cd "$B" && esptool.py --chip "$target" merge_bin -o merged.bin @flash_args )
+              cp "$B/merged.bin" "dist/$N-merged.bin"
+            done
           done
 
           # Prove each merged image really does carry every part at the offset
@@ -104,9 +125,11 @@ jobs:
           # first attempt at this check was inline shell; it passed locally and
           # failed here for reasons the one-line output could not explain, which
           # is exactly why it is a script that says what it compared.
-          for board in mule miner; do
-            echo "=== $board ==="
-            python3 .github/scripts/check_merged_image.py "$board/build"
+          for target in esp32c3 esp32s3; do
+            for board in mule miner; do
+              echo "=== $board ($target) ==="
+              python3 .github/scripts/check_merged_image.py "$board/build-$target"
+            done
           done
 
           (cd dist && sha256sum * > SHA256SUMS.txt)
@@ -114,13 +137,15 @@ jobs:
 
       # Actually boot the images. The offset check above proves the bytes are
       # in the right places; this proves the firmware starts, which is the thing
-      # v1.0.0 got wrong in a way that looked fine everywhere else.
-      - name: Boot both images in QEMU
+      # v1.0.0 got wrong in a way that looked fine everywhere else. The boot
+      # test drives the ESP32-C3 machine (eFuses and all), so it covers the C3
+      # images; the AtomS3 images are covered by the offset check alone.
+      - name: Boot both C3 images in QEMU
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
           for board in mule miner; do
-            python3 .github/scripts/qemu_boot_test.py "$board" "$board/build/merged.bin"
+            python3 .github/scripts/qemu_boot_test.py "$board" "$board/build-esp32c3/merged.bin"
           done
 
       - uses: actions/upload-artifact@v4
@@ -148,13 +173,19 @@ jobs:
 
             **First time / recovery — full USB flash at offset 0x0:**
             ```
+            # ESP32-C3 SuperMini
             esptool.py --chip esp32c3 -p PORT write_flash 0x0 mule-VERSION-merged.bin
             esptool.py --chip esp32c3 -p PORT write_flash 0x0 miner-VERSION-merged.bin
+            # M5Stack AtomS3 (ESP32-S3)
+            esptool.py --chip esp32s3 -p PORT write_flash 0x0 mule-VERSION-atom-s3-merged.bin
+            esptool.py --chip esp32s3 -p PORT write_flash 0x0 miner-VERSION-atom-s3-merged.bin
             ```
+            The web flasher picks the right image for the chip it finds.
 
-            **App image only** (`mule-X.Y.Z.bin` / `miner-X.Y.Z.bin`) is what the
-            mule's own update endpoints take — no USB needed once a unit is on
-            your network.
+            **App image only** (`mule-X.Y.Z.bin` / `miner-X.Y.Z.bin`, or the
+            `-atom-s3` pair) is what the mule's own update endpoints take — no
+            USB needed once a unit is on your network. Use the images for the
+            board you have: an image for the other chip is refused, not flashed.
 
             The two boards **version independently**, so their filenames may
             carry different numbers in the same release — that is expected, and

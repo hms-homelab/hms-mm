@@ -88,9 +88,11 @@ void nvs_config_set_ezshare(const char *ssid, const char *pass)
 
 bool nvs_config_ble_active(void)
 {
-    /* Default OFF: bringing up BLE for the O2Ring disconnects the ezShare WiFi
-     * link (shared radio on the C3), which interrupts CPAP data collection. Ship
-     * disabled; set NVS miner/ble_active=1 (then reboot) to enable for dev. */
+    /* Default OFF: a unit without a ring should not spend radio time or heap
+     * scanning for one. The ring now shares the radio with the held ezShare
+     * link (the stack is dropped before every card transfer), so turning it on
+     * no longer interrupts CPAP collection. Enable with o2_set_enabled, which
+     * writes NVS miner/ble_active=1 and restarts the miner. */
     if (!s_nvs) return false;
     uint8_t v = 0;
     return (nvs_get_u8(s_nvs, "ble_active", &v) == ESP_OK) && (v != 0);
