@@ -5,7 +5,7 @@ independently — a release often touches one board and not the other, and eithe
 can be updated without the other, so in the field they legitimately differ.
 `/api/status` reports both (`fw` and `miner_fw`).
 
-## [1.1.0] - unreleased — miner 1.1.0, mule 1.1.0
+## [1.0.2] - 2026-09-26 — miner 1.0.1, mule 1.0.2
 
 ### Changed — the miner holds its connections
 - **The ezShare link is joined at boot and held.** It is no longer joined per
