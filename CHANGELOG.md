@@ -5,6 +5,23 @@ independently — a release often touches one board and not the other, and eithe
 can be updated without the other, so in the field they legitimately differ.
 `/api/status` reports both (`fw` and `miner_fw`).
 
+## [1.0.3] - 2026-10-01 — miner 1.0.3, mule 1.0.2
+
+Miner only. Numbered 1.0.3 rather than 1.0.2 because the `v1.0.2` tag is the
+mule's 1.0.2 release.
+
+### Changed
+- **A failed card request says why.** The miner answered every failed
+  `/download` or `/dir` with "ezShare request failed" and nothing else, so a
+  card answering an error, a card refusing the connection and a link dropping
+  part way all reached the client as the same 502. The message now carries the
+  card's HTTP status ("ezShare request failed: card answered HTTP 404") or,
+  when the card never answered, the transport error ("ezShare request failed:
+  ESP_ERR_HTTP_CONNECT"). The mule passes it on as the 502 body and in its own
+  log, so `/api/logs` shows it without a serial cable. A request the card never
+  answered used to be reported as `ESP_ERR_HTTP_BASE`; it is now
+  `ESP_ERR_HTTP_FETCH_HEADER`. Host test: `miner/test/host/test_ez_error.c`.
+
 ## [1.0.2] - 2026-09-26 — miner 1.0.1, mule 1.0.2
 
 ### Changed — the miner holds its connections

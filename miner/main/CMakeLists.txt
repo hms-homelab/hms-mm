@@ -8,6 +8,7 @@ idf_component_register(
         "nvs_config.c"
         "crash_guard.c"
         "ez_retry.c"
+        "ez_error.c"
         "o2ring_ble_nimble.c"
         "ota_handler.c"
     INCLUDE_DIRS "."

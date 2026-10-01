@@ -232,7 +232,12 @@ esp_err_t ezshare_raw_get_range(const char *path, size_t chunk_size,
     if (status_code != 200 && status_code != 206) {
         ESP_LOGE(TAG, "HTTP %d (url=%s)", status_code, url);
         esp_http_client_close(client); esp_http_client_cleanup(client);
-        free(chunk_buf); return ESP_ERR_HTTP_BASE + status_code;
+        free(chunk_buf);
+        /* The status goes back to the caller too, so the error the mule sees
+         * can name it. No status at all means the card never answered. */
+        if (status_code <= 0) return ESP_ERR_HTTP_FETCH_HEADER;
+        if (out_http_status) *out_http_status = (uint16_t)status_code;
+        return ESP_ERR_HTTP_BASE + status_code;
     }
 
     if (out_http_status) *out_http_status = (uint16_t)status_code;

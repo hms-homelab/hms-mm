@@ -19,6 +19,7 @@
 #include "uart_handler.h"
 #include "wifi_manager.h"
 #include "ezshare_client.h"
+#include "ez_error.h"
 #include "nvs_config.h"
 #include "config.h"
 #include "o2ring_ble.h"
@@ -825,8 +826,12 @@ static void scanner_task_loop(void *pvParameters)
                     ESP_LOGW(TAG, "proxy req_id=%d aborted by mule", proxy_req_id);
                 } else if (err != ESP_OK || pctx.error) {
                     ESP_LOGE(TAG, "proxy failed: %s", esp_err_to_name(err));
-                    if (!pctx.meta_sent)
-                        send_error_json(proxy_req_id, "ezShare request failed", "HTTP_FAILED");
+                    if (!pctx.meta_sent) {
+                        char why[96];
+                        ez_failure_message(pctx.http_status, esp_err_to_name(err),
+                                           why, sizeof(why));
+                        send_error_json(proxy_req_id, why, "HTTP_FAILED");
+                    }
                 }
 
                 current_state = SCANNER_IDLE;
