@@ -109,4 +109,14 @@ esp_err_t o2ring_ble_download_file_stream(const char *filename,
                                            o2ring_chunk_cb_t cb, void *ctx,
                                            size_t *out_len);
 
+/**
+ * SDD-001: the stack is shared with the AirSense 11 module (ble_stack.h) and
+ * NimBLE runs one scan-or-connect at a time. The scanner task pauses the
+ * ring's search before the machine's module scans and resumes it once the
+ * machine is on. A connected ring is left alone either way: its link is
+ * permanent.
+ */
+void o2ring_ble_search_pause(void);
+void o2ring_ble_search_resume(void);
+
 #endif /* O2RING_BLE_H */

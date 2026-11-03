@@ -9,6 +9,7 @@ idf_component_register(
         "crash_guard.c"
         "ez_retry.c"
         "ez_error.c"
+        "ble_stack.c"
         "o2ring_ble_nimble.c"
         "oxyii_proto.c"
         "ota_handler.c"

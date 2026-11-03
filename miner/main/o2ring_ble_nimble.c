@@ -25,8 +25,7 @@
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
+#include "ble_stack.h"
 #include "nimble/ble.h"
 
 #include "host/ble_hs.h"
@@ -94,8 +93,9 @@ static bool s_oxy_skip_t8520 = false;
 
 /* ── NimBLE / connection state ── */
 
-static uint8_t  s_own_addr_type;
 static ble_addr_t s_peer_addr;
+/* SDD-001: the scanner task is connecting the machine; the ring's search waits. */
+static bool     s_paused = false;
 static bool     s_have_cached = false;
 static bool     s_connecting_cached = false;
 static bool     s_connecting = false;
@@ -120,6 +120,9 @@ static EventGroupHandle_t s_cmd_events;
 #define EVT_CONNECTED       (1 << 1)
 #define EVT_CLOSE_ACK       (1 << 2)
 #define EVT_DISCONNECTED    (1 << 3)   /* deinit waits for this before the host stop */
+/* SDD-001: the shortest connection interval (1.25 ms units) the controller
+ * takes for the ring next to the machine's 15 ms link: 30 ms. */
+#define O2RING_ITVL_FLOOR   24
 
 /* Cached live reading */
 static o2ring_live_t s_live = {0};
@@ -884,7 +887,18 @@ static int svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static void start_connection_attempt(void)
 {
-    if (s_stopping || !s_stack_running || s_connected || s_scanning || s_connecting) return;
+    /* s_paused: the scanner task is connecting the machine and resumes this
+     * when it is on. */
+    if (s_stopping || !s_stack_running || s_connected || s_scanning || s_connecting ||
+        s_paused) return;
+
+    /* The shared stack's one scan-or-connect at a time. Never waited for
+     * here (this runs on the host task as often as not): when the machine
+     * holds it, the scanner task's resume brings us back once it is on. */
+    if (!ble_stack_master_take(BLE_USER_RING, 0)) {
+        ESP_LOGI(TAG, "radio busy with the machine; the ring's search waits");
+        return;
+    }
 
     if (s_have_cached) {
         s_connecting_cached = true;
@@ -893,12 +907,13 @@ static void start_connection_attempt(void)
                  "%02x:%02x:%02x:%02x:%02x:%02x",
                  s_peer_addr.val[0], s_peer_addr.val[1], s_peer_addr.val[2],
                  s_peer_addr.val[3], s_peer_addr.val[4], s_peer_addr.val[5]);
-        int rc = ble_gap_connect(s_own_addr_type, &s_peer_addr, 15000, NULL,
+        int rc = ble_gap_connect(ble_stack_own_addr_type(), &s_peer_addr, 15000, NULL,
                                  gap_event, NULL);
         if (rc != 0) {
             ESP_LOGW(TAG, "Direct connect failed: %d", rc);
             s_connecting_cached = false;
             s_connecting = false;
+            ble_stack_master_give(BLE_USER_RING);
             o2ring_clear_cached_addr();
             s_have_cached = false;
             start_connection_attempt();
@@ -915,13 +930,14 @@ static void start_connection_attempt(void)
     scan_params.filter_duplicates = 1;
     scan_params.disable_observer_mode = 0;
 
-    int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &scan_params,
+    int rc = ble_gap_disc(ble_stack_own_addr_type(), BLE_HS_FOREVER, &scan_params,
                           gap_event, NULL);
     if (rc == 0) {
         s_scanning = true;
         ESP_LOGI(TAG, "Scanning for O2 Ring...");
     } else {
         ESP_LOGE(TAG, "Scan start failed: %d", rc);
+        ble_stack_master_give(BLE_USER_RING);
     }
 }
 
@@ -981,12 +997,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                              s_peer_addr.val[0], s_peer_addr.val[1], s_peer_addr.val[2],
                              s_peer_addr.val[3], s_peer_addr.val[4], s_peer_addr.val[5]);
                     s_connecting = true;
-                    int rc = ble_gap_connect(s_own_addr_type, &s_peer_addr, 15000, NULL,
+                    /* The master token taken for the scan carries over. */
+                    int rc = ble_gap_connect(ble_stack_own_addr_type(), &s_peer_addr, 15000, NULL,
                                              gap_event, NULL);
                     if (rc != 0) {
                         ESP_LOGW(TAG, "Connect after scan failed: %d", rc);
                         s_connecting_cached = false;
                         s_connecting = false;
+                        ble_stack_master_give(BLE_USER_RING);
                         if (s_auto_reconnect && !s_stopping) start_connection_attempt();
                     }
                 }
@@ -996,12 +1014,16 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
         s_scanning = false;
+        /* The scan is over; a restart below takes the token again. A connect
+         * started from a DISC match keeps it (this event does not fire then). */
+        ble_stack_master_give(BLE_USER_RING);
         if (!s_connected && !s_connecting && !s_stopping && s_auto_reconnect) {
             start_connection_attempt();
         }
         return 0;
 
     case BLE_GAP_EVENT_CONNECT:
+        ble_stack_master_give(BLE_USER_RING);   /* the procedure ended, either way */
         if (event->connect.status == 0) {
             ESP_LOGI(TAG, "Connected");
             s_conn_handle = event->connect.conn_handle;
@@ -1083,10 +1105,39 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             start_connection_attempt();
         return 0;
 
+    case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:   /* the ring asks over L2CAP; same fields */
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ: {
+        /* With the machine's 15 ms link beside it, the controller refused the
+         * ring's own request for 7.5..30 ms and the ring hung up after the
+         * third refusal (reason 0x3B, every ~94 s). Answer inside the ring's
+         * range, from the slow end: the interval the controller can schedule
+         * next to the other link. Over L2CAP NimBLE hands only peer_params
+         * and relays THAT struct to the controller after this returns, so the
+         * answer is written into it; over the link layer self_params is the
+         * answer. */
+        /* Declared const, but over L2CAP it is the struct NimBLE relays, so
+         * it is written on purpose (see above). */
+        struct ble_gap_upd_params *peer =
+            (struct ble_gap_upd_params *)event->conn_update_req.peer_params;
+        struct ble_gap_upd_params *ans  = event->conn_update_req.self_params ?
+                                          event->conn_update_req.self_params : peer;
+        if (peer && ans) {
+            const uint16_t asked_min = peer->itvl_min, asked_max = peer->itvl_max;
+            if (ans != peer) *ans = *peer;
+            if (ans->itvl_max < O2RING_ITVL_FLOOR) ans->itvl_max = O2RING_ITVL_FLOOR;
+            if (ans->itvl_min < ans->itvl_max) ans->itvl_min = ans->itvl_max;
+            ESP_LOGI(TAG, "ring asks itvl %u..%u latency %u: answering %u..%u",
+                     asked_min, asked_max, peer->latency, ans->itvl_min, ans->itvl_max);
+        }
+        return 0;
+    }
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        if (event->conn_update.status != 0)
+            ESP_LOGW(TAG, "connection update failed: %d", event->conn_update.status);
+        return 0;
+
     case BLE_GAP_EVENT_SUBSCRIBE:
     case BLE_GAP_EVENT_NOTIFY_TX:
-    case BLE_GAP_EVENT_CONN_UPDATE:
-    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
     case BLE_GAP_EVENT_REPEAT_PAIRING:
     default:
         return 0;
@@ -1095,30 +1146,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
-static void o2ring_nimble_host_task(void *arg)
-{
-    (void)arg;
-    ESP_LOGI(TAG, "NimBLE host task started");
-    nimble_port_run();
-    nimble_port_freertos_deinit();
-}
-
-static void o2ring_on_sync(void)
-{
-    int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed: %d", rc);
-        return;
-    }
-
-    ESP_LOGI(TAG, "NimBLE sync complete");
-    start_connection_attempt();
-}
-
-static void o2ring_on_reset(int reason)
-{
-    ESP_LOGW(TAG, "NimBLE reset: %d", reason);
-}
+/* The host task, the sync and the reset callbacks live in ble_stack.c, shared
+ * with the AirSense 11; the first connect attempt starts from o2ring_ble_init. */
 
 /* ── OxyII operations behind the public API (SDD-001). Called with s_cmd_mutex held. ── */
 
@@ -1314,36 +1343,19 @@ esp_err_t o2ring_ble_init(void)
 
     o2ring_load_cached_addr();
 
-    esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "Classic BT mem release failed: %s", esp_err_to_name(ret));
+    /* SDD-001: the stack is shared with the machine (ble_stack.c). The owner
+     * brings NimBLE up on the first acquire and has synced by the time this
+     * returns, so the first connect attempt starts right here, on this task,
+     * instead of from a sync callback. */
+    if (!ble_stack_acquire(BLE_USER_RING)) {
+        ESP_LOGE(TAG, "the shared stack did not come up");
+        return ESP_FAIL;
     }
-
-    ret = nimble_port_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ble_hs_cfg.sync_cb = o2ring_on_sync;
-    ble_hs_cfg.reset_cb = o2ring_on_reset;
-    ble_hs_cfg.sm_bonding = 0;
-    ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 0;
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
-    ble_hs_cfg.sm_our_key_dist = 0;
-    ble_hs_cfg.sm_their_key_dist = 0;
-
-    /* Set BEFORE starting the host task, not after. The host task syncs almost
-     * immediately and o2ring_on_sync() calls start_connection_attempt(), whose
-     * first guard is `!s_stack_running` — the one exit from that function that
-     * logs nothing. Set afterwards, sync always lost the race, the attempt
-     * returned silently, and every request sat out its full connect timeout
-     * having never scanned. */
     s_stack_running = true;
-    nimble_port_freertos_init(o2ring_nimble_host_task);
-
-    ESP_LOGI(TAG, "BLE ready (NimBLE host started)");
+    s_paused = false;
+    ESP_LOGI(TAG, "BLE ready (shared stack, %d user%s)", ble_stack_users(),
+             ble_stack_users() == 1 ? "" : "s");
+    start_connection_attempt();
     return ESP_OK;
 }
 
@@ -1379,8 +1391,8 @@ void o2ring_ble_deinit(void)
         }
     }
 
-    nimble_port_stop();
-    nimble_port_deinit();
+    ble_stack_master_give(BLE_USER_RING);
+    ble_stack_release(BLE_USER_RING);
 
     s_stack_running = false;
     s_ready = false;
@@ -1394,14 +1406,16 @@ void o2ring_ble_deinit(void)
     s_cccd_handle = 0;
     s_svc_start = s_svc_end = 0;
 
-    ESP_LOGI(TAG, "BLE deinitialized — memory released");
+    ESP_LOGI(TAG, "BLE deinitialized (stack %s)",
+             ble_stack_is_up() ? "still up for the machine" : "down");
 }
 
 esp_err_t o2ring_ble_start_scan(void)
 {
     if (!s_stack_running) return ESP_ERR_INVALID_STATE;
     if (s_scanning || s_connected) return ESP_OK;
-    int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER,
+    if (!ble_stack_master_take(BLE_USER_RING, 0)) return ESP_ERR_INVALID_STATE;
+    int rc = ble_gap_disc(ble_stack_own_addr_type(), BLE_HS_FOREVER,
                         &(struct ble_gap_disc_params){
                             .itvl = 0x80,
                             .window = 0x40,
@@ -1413,6 +1427,7 @@ esp_err_t o2ring_ble_start_scan(void)
                         },
                         gap_event, NULL);
     if (rc == 0) s_scanning = true;
+    else ble_stack_master_give(BLE_USER_RING);
     return rc;
 }
 
@@ -1421,6 +1436,7 @@ esp_err_t o2ring_ble_stop(void)
     s_stopping = true;
     s_connecting = false;
     if (s_scanning) ble_gap_disc_cancel();
+    ble_stack_master_give(BLE_USER_RING);
     if (s_connected && s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     return ESP_OK;
@@ -1550,8 +1566,43 @@ esp_err_t o2ring_ble_connect_and_wait(uint32_t timeout_ms)
         elapsed += 500;
     }
 
-    if (s_scanning) ble_gap_disc_cancel();
+    if (s_scanning) { ble_gap_disc_cancel(); s_scanning = false; ble_stack_master_give(BLE_USER_RING); }
     return ESP_ERR_TIMEOUT;
+}
+
+/* ── SDD-001: the machine comes first ──
+ * The scanner task pauses the ring's search (a scan, or a connect in flight)
+ * before the machine's module scans, and resumes it once the machine is on. A
+ * ring that is already connected is not touched: its link is permanent. */
+void o2ring_ble_search_pause(void)
+{
+    if (!s_stack_running) return;
+    s_paused = true;
+    bool cancelled = false;
+    if (s_scanning) {
+        ble_gap_disc_cancel();
+        s_scanning = false;
+        cancelled = true;
+    }
+    if (s_connecting && !s_connected) {
+        ble_gap_conn_cancel();
+        s_connecting = false;
+        s_connecting_cached = false;
+        cancelled = true;
+    }
+    /* Both cancels finish asynchronously. */
+    for (int i = 0; i < 20 && (ble_gap_conn_active() || ble_gap_disc_active()); i++)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    ble_stack_master_give(BLE_USER_RING);
+    if (cancelled) ESP_LOGI(TAG, "search paused for the machine");
+}
+
+void o2ring_ble_search_resume(void)
+{
+    if (!s_stack_running) return;
+    s_paused = false;
+    if (!s_connected && !s_connecting && !s_stopping && s_auto_reconnect)
+        start_connection_attempt();
 }
 
 esp_err_t o2ring_ble_read_sensors(void)
