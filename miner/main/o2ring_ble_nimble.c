@@ -40,6 +40,9 @@
 #include "host/util/util.h"
 
 #include "cJSON.h"
+#include "mbedtls/aes.h"
+
+#include "oxyii_proto.h"
 
 static const char *TAG = "o2ring_nimble";
 
@@ -54,6 +57,30 @@ static const ble_uuid128_t WRITE_UUID = BLE_UUID128_INIT(
 static const ble_uuid128_t NOTIFY_UUID = BLE_UUID128_INIT(
     0x57, 0x9a, 0x05, 0x43, 0x52, 0xcd, 0xb1, 0xa6,
     0x1a, 0x4b, 0xe7, 0xa8, 0x4a, 0x59, 0x34, 0x07);
+
+/* SDD-001: the O2Ring-S (T8520) has none of the above. It speaks "OxyII" on
+ * E8FB0001-A14B-98F9-831B-4E2941D01248, write ...0002, notify ...0003. */
+static const ble_uuid128_t OXY_SVC_UUID = BLE_UUID128_INIT(
+    0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
+    0xf9, 0x98, 0x4b, 0xa1, 0x01, 0x00, 0xfb, 0xe8);
+static const ble_uuid128_t OXY_WRITE_UUID = BLE_UUID128_INIT(
+    0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
+    0xf9, 0x98, 0x4b, 0xa1, 0x02, 0x00, 0xfb, 0xe8);
+static const ble_uuid128_t OXY_NOTIFY_UUID = BLE_UUID128_INIT(
+    0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
+    0xf9, 0x98, 0x4b, 0xa1, 0x03, 0x00, 0xfb, 0xe8);
+
+/* Which protocol the ring in hand speaks, chosen when the scan matches it. A
+ * cached address in NVS is always a legacy ring: an O2Ring-S is never cached
+ * across boots, because its address changes between its worn and idle
+ * identities and on a factory reset. */
+typedef enum { RING_LEGACY = 0, RING_OXYII } ring_proto_t;
+static ring_proto_t s_proto = RING_LEGACY;
+/* The match was the worn identity ("T8520_..."), which may not expose the
+ * OxyII service. When discovery confirms that, that identity is passed over
+ * until the stack restarts, so the idle one ("S8-AW") is found. */
+static bool s_oxy_by_t8520 = false;
+static bool s_oxy_skip_t8520 = false;
 
 /* ── Viatom protocol constants ── */
 
@@ -120,6 +147,20 @@ static void    *s_dl_cb_ctx;
 
 /* Cached device info */
 static o2ring_device_info_t s_info;
+
+/* OxyII request/reply state. A reply carries the request's opcode; the caller
+ * waits for that opcode and anything else is dropped. s_oxy_session is the
+ * per-connection handshake (auth, setup, time) and is cleared on every link. */
+static uint8_t           s_oxy_seq;
+static volatile int      s_oxy_wait_op = -1;
+static bool              s_oxy_session;
+static oxyii_info_t      s_oxy_info;
+
+/* Set when the ring answered auth with a session key: every payload after it
+ * is AES-128-ECB (oxyii_proto.h). Per connection, like s_oxy_session. */
+static bool                s_oxy_encrypted;
+static mbedtls_aes_context s_oxy_aes_enc;
+static mbedtls_aes_context s_oxy_aes_dec;
 
 /* Notification flatten buffer (host callback context). */
 #define NOTIFY_FLAT_BUF_SIZE 1024
@@ -302,11 +343,45 @@ static void dispatch_frame(const uint8_t *frame, size_t len)
     xEventGroupSetBits(s_cmd_events, bits_to_set);
 }
 
+/* OxyII replies: the one the caller waits for lands in s_resp_buf. Runs in the
+ * NimBLE host task, so it never blocks: downloads are driven from the caller's
+ * task, one F3 per reply, not chained from here as the legacy path does. */
+static void oxy_process_notification(void)
+{
+    for (;;) {
+        size_t skip = 0, flen = 0;
+        bool whole = oxyii_find_frame(s_reasm, s_reasm_len, &skip, &flen);
+        if (skip) {
+            memmove(s_reasm, s_reasm + skip, s_reasm_len - skip);
+            s_reasm_len -= skip;
+        }
+        if (!whole) return;
+
+        uint8_t  op   = oxyii_frame_op(s_reasm);
+        uint16_t plen = oxyii_frame_len(s_reasm);
+        if ((int)op == s_oxy_wait_op && plen <= RESP_BUF_SIZE) {
+            memcpy(s_resp_buf, oxyii_frame_payload(s_reasm), plen);
+            s_resp_len = plen;
+            s_oxy_wait_op = -1;
+            xEventGroupSetBits(s_cmd_events, EVT_RESPONSE_READY);
+        } else {
+            ESP_LOGD(TAG, "oxyii: unawaited reply op=0x%02x len=%u", op, plen);
+        }
+        memmove(s_reasm, s_reasm + flen, s_reasm_len - flen);
+        s_reasm_len -= flen;
+    }
+}
+
 static void process_notification(const uint8_t *data, size_t len)
 {
     if (s_reasm_len + len > REASM_BUF_SIZE) s_reasm_len = 0;
     memcpy(s_reasm + s_reasm_len, data, len);
     s_reasm_len += len;
+
+    if (s_proto == RING_OXYII) {
+        oxy_process_notification();
+        return;
+    }
 
     while (s_reasm_len > 0) {
         while (s_reasm_len > 0 &&
@@ -356,6 +431,184 @@ static esp_err_t send_and_wait(uint8_t cmd, uint16_t block,
                                            pdMS_TO_TICKS(timeout_ms));
     if (!(bits & EVT_RESPONSE_READY)) return ESP_ERR_TIMEOUT;
     return ESP_OK;
+}
+
+/* ── OxyII (O2Ring-S) requests, SDD-001 ── */
+
+static void oxy_aes_enc_block(void *ctx, const uint8_t in[16], uint8_t out[16])
+{
+    mbedtls_aes_crypt_ecb((mbedtls_aes_context *)ctx, MBEDTLS_AES_ENCRYPT, in, out);
+}
+
+static void oxy_aes_dec_block(void *ctx, const uint8_t in[16], uint8_t out[16])
+{
+    mbedtls_aes_crypt_ecb((mbedtls_aes_context *)ctx, MBEDTLS_AES_DECRYPT, in, out);
+}
+
+/* One frame, in as few writes as the negotiated MTU allows: with the 517 the
+ * ring needs, every request is a single write. In an encrypted session a
+ * non-empty payload goes as ciphertext; auth never does. */
+static esp_err_t oxy_send(uint8_t op, const uint8_t *payload, uint16_t len)
+{
+    if (!s_ready || s_write_handle == 0 || s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
+        return ESP_ERR_INVALID_STATE;
+    uint8_t cipher[64];
+    if (s_oxy_encrypted && len > 0 && op != OXYII_OP_AUTH) {
+        size_t clen = oxyii_encrypt(oxy_aes_enc_block, &s_oxy_aes_enc, payload, len,
+                                    cipher, sizeof(cipher));
+        if (clen == 0) return ESP_ERR_INVALID_SIZE;
+        payload = cipher;
+        len = (uint16_t)clen;
+    }
+    size_t frame_len = oxyii_encode(op, s_oxy_seq++, payload, len,
+                                    s_cmd_frame, sizeof(s_cmd_frame));
+    if (frame_len == 0) return ESP_ERR_INVALID_SIZE;
+
+    uint16_t mtu = ble_att_mtu(s_conn_handle);
+    size_t max = mtu > 3 ? (size_t)mtu - 3 : 20;
+    for (size_t sent = 0; sent < frame_len; ) {
+        size_t chunk = frame_len - sent;
+        if (chunk > max) chunk = max;
+        int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_handle,
+                                             s_cmd_frame + sent, chunk);
+        if (rc != 0) return ESP_FAIL;
+        sent += chunk;
+        if (sent < frame_len) vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return ESP_OK;
+}
+
+/* Sends op and waits for the reply with the same opcode. A dropped link ends
+ * the wait at once rather than at the timeout. */
+static esp_err_t oxy_request(uint8_t op, const uint8_t *payload, uint16_t len,
+                             uint32_t timeout_ms)
+{
+    xEventGroupClearBits(s_cmd_events, EVT_RESPONSE_READY | EVT_DISCONNECTED);
+    s_resp_len = 0;
+    s_oxy_wait_op = op;
+    esp_err_t ret = oxy_send(op, payload, len);
+    if (ret != ESP_OK) {
+        s_oxy_wait_op = -1;
+        return ret;
+    }
+    EventBits_t bits = xEventGroupWaitBits(s_cmd_events,
+                                           EVT_RESPONSE_READY | EVT_DISCONNECTED,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    xEventGroupClearBits(s_cmd_events, EVT_RESPONSE_READY);
+    s_oxy_wait_op = -1;
+    if (!(bits & EVT_RESPONSE_READY))
+        return (bits & EVT_DISCONNECTED) ? ESP_ERR_INVALID_STATE : ESP_ERR_TIMEOUT;
+
+    /* Decrypted here, in the caller's task, not in the host task that copied it. */
+    if (s_oxy_encrypted && s_resp_len > 0 && oxyii_reply_encrypted(op)) {
+        int n = oxyii_decrypt(oxy_aes_dec_block, &s_oxy_aes_dec, s_resp_buf, s_resp_len);
+        if (n < 0) {
+            ESP_LOGW(TAG, "oxyii: reply to 0x%02x (%u bytes) did not decrypt",
+                     op, (unsigned)s_resp_len);
+            s_resp_len = 0;
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        s_resp_len = (size_t)n;
+    }
+    return ESP_OK;
+}
+
+/* The ring answered auth: is it a session key? Sets up both AES contexts when it is. */
+static void oxy_take_auth_reply(void)
+{
+    uint8_t key[OXYII_KEY_LEN];
+    if (!oxyii_parse_auth_reply(s_resp_buf, s_resp_len, key)) {
+        ESP_LOGI(TAG, "oxyii: auth answered with %u bytes, no key: plaintext session",
+                 (unsigned)s_resp_len);
+        return;
+    }
+    mbedtls_aes_free(&s_oxy_aes_enc);
+    mbedtls_aes_free(&s_oxy_aes_dec);
+    mbedtls_aes_init(&s_oxy_aes_enc);
+    mbedtls_aes_init(&s_oxy_aes_dec);
+    if (mbedtls_aes_setkey_enc(&s_oxy_aes_enc, key, 128) != 0 ||
+        mbedtls_aes_setkey_dec(&s_oxy_aes_dec, key, 128) != 0) {
+        ESP_LOGE(TAG, "oxyii: session key rejected by AES setup");
+        return;
+    }
+    s_oxy_encrypted = true;
+    ESP_LOGI(TAG, "oxyii: session key received: AES-128 session");
+}
+
+/* The per-connection handshake, run once on each link before anything else, in
+ * the vendor SDK's order: auth 0xFF, setup 0x10, GET_INFO, set time 0xC0,
+ * GET_CONFIG 0x00. File opens are silently refused without it.
+ *
+ * Auth waits a second for an answer, as the vendor apps do. Older rings never
+ * give one and the session stays plaintext; newer ones answer with a session
+ * key and everything after is encrypted (oxyii_proto.h). The timestamp in the
+ * auth payload is a nonce the ring does not check.
+ *
+ * The miner has no wall clock, so 0xC0 writes back the time the ring itself
+ * reported in GET_INFO: the step the ring wants is done and its clock, and so
+ * its file names, stay as the owner's app set them. Called with s_cmd_mutex
+ * held. */
+static esp_err_t oxy_ensure_session(void)
+{
+    if (s_oxy_session) return ESP_OK;
+    s_oxy_encrypted = false;
+
+    uint8_t auth[OXYII_AUTH_LEN];
+    oxyii_auth_payload(0, auth);
+    esp_err_t ret = oxy_request(OXYII_OP_AUTH, auth, sizeof(auth), 1000);
+    if (ret == ESP_OK) {
+        oxy_take_auth_reply();
+    } else if (ret != ESP_ERR_TIMEOUT) {
+        return ret;
+    }
+
+    /* Required on a plaintext ring; on an encrypted one the vendor apps only
+     * log its failure, and so does this. */
+    const uint8_t zero = 0x00;
+    ret = oxy_request(OXYII_OP_SETUP, &zero, 1, 3000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "oxyii: setup 0x10 failed: %s", esp_err_to_name(ret));
+        if (!s_oxy_encrypted) return ret;
+    }
+
+    ret = oxy_request(OXYII_OP_GET_INFO, NULL, 0, 5000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "oxyii: GET_INFO failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    oxyii_parse_info(s_resp_buf, s_resp_len, &s_oxy_info);
+    ESP_LOGI(TAG, "oxyii: O2Ring-S SN=%s fw=%s clock=%04u-%02u-%02u %02u:%02u:%02u%s%s",
+             s_oxy_info.serial, s_oxy_info.firmware, s_oxy_info.clock.year,
+             s_oxy_info.clock.month, s_oxy_info.clock.day, s_oxy_info.clock.hour,
+             s_oxy_info.clock.minute, s_oxy_info.clock.second,
+             s_oxy_info.clock_valid ? "" : " (NOT SET)",
+             s_oxy_encrypted ? " (encrypted)" : "");
+
+    if (s_oxy_info.clock_valid) {
+        uint8_t t[OXYII_TIME_LEN];
+        oxyii_time_payload(&s_oxy_info.clock, t);
+        ret = oxy_request(OXYII_OP_SET_TIME, t, sizeof(t), 3000);
+        if (ret != ESP_OK) ESP_LOGW(TAG, "oxyii: set time: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGW(TAG, "oxyii: the ring's clock is not set; file reads may be refused "
+                      "until its app has set it once");
+    }
+
+    ret = oxy_request(OXYII_OP_GET_CONFIG, NULL, 0, 3000);
+    if (ret != ESP_OK) ESP_LOGW(TAG, "oxyii: GET_CONFIG: %s", esp_err_to_name(ret));
+
+    s_oxy_session = true;
+    return ESP_OK;
+}
+
+/* 0xF4 clears a handle the ring's own overnight recording left open, without
+ * which 0xF1 hangs (the "F1 wedge"). A no-op when nothing is open, and some
+ * firmware does not answer it then, so a timeout is not a failure. */
+static void oxy_close_file(void)
+{
+    esp_err_t ret = oxy_request(OXYII_OP_FILE_END, NULL, 0, 2000);
+    if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT)
+        ESP_LOGW(TAG, "oxyii: close: %s", esp_err_to_name(ret));
 }
 
 /* ── Helpers ── */
@@ -414,6 +667,29 @@ static bool adv_advertises_svc_uuid(const struct ble_hs_adv_fields *f)
         if (ble_uuid_cmp(&f->uuids128[i].u, &SVC_UUID.u) == 0) return true;
     }
     return false;
+}
+
+/* SDD-001: an O2Ring-S, by its name or the OxyII service. *by_t8520 says the
+ * match was only its worn-mode name. */
+static bool adv_is_oxyii(const struct ble_hs_adv_fields *f, const uint8_t *name,
+                         size_t name_len, bool *by_t8520)
+{
+    char lower[33] = {0};
+    size_t n = 0;
+    if (name) n = name_len < sizeof(lower) - 1 ? name_len : sizeof(lower) - 1;
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)name[i];
+        lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    /* By its name or its OxyII service only. NOT by manufacturer ID 0xF34E:
+     * the original O2Ring advertises it too, and matching on it took that
+     * ring down this path. */
+    bool svc = false;
+    for (int i = 0; i < f->num_uuids128; i++)
+        if (ble_uuid_cmp(&f->uuids128[i].u, &OXY_SVC_UUID.u) == 0) svc = true;
+    bool named = n > 0 && oxyii_name_matches(lower);
+    if (by_t8520) *by_t8520 = !svc && strncmp(lower, "t8520", 5) == 0;
+    return svc || named;
 }
 
 static void fail_and_rescan(void)
@@ -537,11 +813,11 @@ static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
     switch (error->status) {
     case 0:
-        if (uuid128_eq(&chr->uuid.u, &WRITE_UUID)) {
+        if (uuid128_eq(&chr->uuid.u, s_proto == RING_OXYII ? &OXY_WRITE_UUID : &WRITE_UUID)) {
             s_write_handle = chr->val_handle;
             ESP_LOGI(TAG, "Write handle: 0x%04x", s_write_handle);
         }
-        if (uuid128_eq(&chr->uuid.u, &NOTIFY_UUID)) {
+        if (uuid128_eq(&chr->uuid.u, s_proto == RING_OXYII ? &OXY_NOTIFY_UUID : &NOTIFY_UUID)) {
             s_notify_handle = chr->val_handle;
             ESP_LOGI(TAG, "Notify handle: 0x%04x", s_notify_handle);
         }
@@ -571,17 +847,28 @@ static int svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
     switch (error->status) {
     case 0:
-        if (service && uuid128_eq(&service->uuid.u, &SVC_UUID)) {
+        if (service && uuid128_eq(&service->uuid.u,
+                                  s_proto == RING_OXYII ? &OXY_SVC_UUID : &SVC_UUID)) {
             s_svc_start = service->start_handle;
             s_svc_end = service->end_handle;
             s_service_found = true;
-            ESP_LOGI(TAG, "Viatom service 0x%04x-0x%04x", s_svc_start, s_svc_end);
+            ESP_LOGI(TAG, "%s service 0x%04x-0x%04x",
+                     s_proto == RING_OXYII ? "OxyII" : "Viatom", s_svc_start, s_svc_end);
         }
         return 0;
 
     case BLE_HS_EDONE:
         if (!s_service_found) {
-            ESP_LOGE(TAG, "Viatom service not found");
+            ESP_LOGE(TAG, "%s service not found", s_proto == RING_OXYII ? "OxyII" : "Viatom");
+            if (s_proto == RING_OXYII && s_oxy_by_t8520) {
+                /* The worn identity without the service: pass it over and scan
+                 * for the idle identity instead of reconnecting to this
+                 * address forever. */
+                ESP_LOGW(TAG, "oxyii: T8520 identity has no OxyII service; "
+                              "waiting for its S8-AW identity");
+                s_oxy_skip_t8520 = true;
+                s_have_cached = false;
+            }
             fail_and_rescan();
             return 0;
         }
@@ -658,7 +945,18 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                     memcpy(namebuf, fields.name, copy_len);
                 }
                 bool match = false;
-                if (name_matches_known_device(fields.name, fields.name_len)) {
+                bool by_t8520 = false;
+                ring_proto_t proto = RING_LEGACY;
+                if (adv_is_oxyii(&fields, fields.name, fields.name_len, &by_t8520)) {
+                    if (by_t8520 && s_oxy_skip_t8520) {
+                        /* passed over: its worn identity had no OxyII service */
+                    } else {
+                        ESP_LOGI(TAG, "Found O2Ring-S (OxyII): %s RSSI=%d",
+                                 namebuf[0] ? namebuf : "<none>", event->disc.rssi);
+                        match = true;
+                        proto = RING_OXYII;
+                    }
+                } else if (name_matches_known_device(fields.name, fields.name_len)) {
                     ESP_LOGI(TAG, "Found by name: %s RSSI=%d", namebuf, event->disc.rssi);
                     match = true;
                 } else if (adv_advertises_svc_uuid(&fields)) {
@@ -674,7 +972,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                     s_peer_addr = event->disc.addr;
                     s_have_cached = true;
                     s_connecting_cached = false;
-                    o2ring_save_cached_addr();
+                    s_proto = proto;
+                    s_oxy_by_t8520 = by_t8520;
+                    /* Only a legacy ring's address is worth keeping across
+                     * boots; an O2Ring-S is found by scan every time. */
+                    if (proto == RING_LEGACY) o2ring_save_cached_addr();
                     ESP_LOGI(TAG, "Connecting to %02x:%02x:%02x:%02x:%02x:%02x",
                              s_peer_addr.val[0], s_peer_addr.val[1], s_peer_addr.val[2],
                              s_peer_addr.val[3], s_peer_addr.val[4], s_peer_addr.val[5]);
@@ -713,6 +1015,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_write_handle = 0;
             s_notify_handle = 0;
             s_cccd_handle = 0;
+            s_oxy_session = false;
 
             ble_att_set_preferred_mtu(BLE_ATT_MTU_MAX);
             ble_gattc_exchange_mtu(s_conn_handle, NULL, NULL);
@@ -732,7 +1035,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         if (event->mtu.conn_handle == s_conn_handle) {
             ESP_LOGI(TAG, "MTU updated: %u", event->mtu.value);
-            return ble_gattc_disc_svc_by_uuid(s_conn_handle, &SVC_UUID.u,
+            /* An O2Ring-S refuses file opens below 517. Logged, not refused
+             * here: a ring that reads files at less says so by working. */
+            if (s_proto == RING_OXYII && event->mtu.value < 517)
+                ESP_LOGW(TAG, "oxyii: MTU %u is under the 517 file reads need",
+                         event->mtu.value);
+            return ble_gattc_disc_svc_by_uuid(s_conn_handle,
+                                              s_proto == RING_OXYII ? &OXY_SVC_UUID.u
+                                                                    : &SVC_UUID.u,
                                               svc_disc_cb, NULL);
         }
         return 0;
@@ -766,6 +1076,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_dl_buf_size = 0;
         s_dl_offset = 0;
         s_resp_len = 0;
+        s_oxy_session = false;
+        s_oxy_wait_op = -1;
         s_connecting = false;
         if (!s_stopping && s_auto_reconnect && !s_connecting)
             start_connection_attempt();
@@ -808,6 +1120,158 @@ static void o2ring_on_reset(int reason)
     ESP_LOGW(TAG, "NimBLE reset: %d", reason);
 }
 
+/* ── OxyII operations behind the public API (SDD-001). Called with s_cmd_mutex held. ── */
+
+static esp_err_t oxy_refresh_info(void)
+{
+    s_info.valid = false;
+    esp_err_t ret = oxy_ensure_session();
+    if (ret != ESP_OK) return ret;
+
+    oxy_close_file();   /* the F1 wedge */
+    ret = oxy_request(OXYII_OP_FILE_LIST, NULL, 0, 5000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "oxyii: file list failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    memset(s_info.files, 0, sizeof(s_info.files));
+    int total = 0;
+    s_info.file_count = oxyii_parse_file_list(s_resp_buf, s_resp_len, s_info.files[0].name,
+                                              sizeof(s_info.files[0]), O2RING_MAX_FILES,
+                                              &total);
+
+    /* GET_BATTERY: its byte [1] is the percentage. */
+    if (oxy_request(OXYII_OP_GET_BATTERY, NULL, 0, 3000) == ESP_OK && s_resp_len >= 2)
+        s_info.battery = s_resp_buf[1];
+
+    strncpy(s_info.model, "O2Ring-S", sizeof(s_info.model) - 1);
+    strncpy(s_info.serial, s_oxy_info.serial, sizeof(s_info.serial) - 1);
+    s_info.valid = true;
+
+    ESP_LOGI(TAG, "Device: %s SN=%s Batt=%u%% Files=%d (of %d on the ring)",
+             s_info.model, s_info.serial, s_info.battery, s_info.file_count, total);
+    for (int i = 0; i < s_info.file_count; i++)
+        ESP_LOGI(TAG, "  [%d] %s", i, s_info.files[i].name);
+    return ESP_OK;
+}
+
+static esp_err_t oxy_read_sensors(void)
+{
+    esp_err_t ret = oxy_ensure_session();
+    if (ret != ESP_OK) return ret;
+    ret = oxy_request(OXYII_OP_LIVE, NULL, 0, 5000);
+    if (ret != ESP_OK) return ret;
+
+    oxyii_live_t l;
+    if (!oxyii_parse_live(s_resp_buf, s_resp_len, &l)) {
+        ESP_LOGW(TAG, "oxyii: live reply too short (%u bytes)", (unsigned)s_resp_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    s_live.spo2 = l.reading ? l.spo2 : 0xFF;
+    s_live.hr = l.reading ? l.hr : 0xFF;
+    s_live.motion = l.motion;
+    s_live.vibration = 0;
+    s_live.timestamp = esp_timer_get_time();
+    s_live.valid = l.reading;
+    ESP_LOGI(TAG, "Live: SpO2=%u HR=%u PI=%u.%u motion=%u sensor=%u run=%u batt=%u%%",
+             l.spo2, l.hr, l.pi_x10 / 10, l.pi_x10 % 10, l.motion, l.state, l.run, l.battery);
+    return ESP_OK;
+}
+
+/* Firmware 2D010003 caps what one connection may transfer, so a pull that
+ * stalls part-way reconnects and carries on at its offset. Each resume is
+ * bounded by the 15 s connect, inside the 30 s the mule waits for the next
+ * chunk. */
+#define OXY_MAX_RESUMES 3
+
+static esp_err_t oxy_download_stream(const char *filename, o2ring_size_cb_t size_cb,
+                                     o2ring_chunk_cb_t cb, void *ctx, size_t *out_len)
+{
+    uint8_t start[OXYII_FILE_START_LEN];
+    if (!oxyii_file_start_payload(filename, start)) {
+        ESP_LOGE(TAG, "oxyii: %s is not an O2Ring-S file name", filename);
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_LOGI(TAG, "Streaming download: %s", filename);
+
+    uint32_t size = 0, offset = 0;
+    bool sized = false;
+    int resumes = 0;
+    esp_err_t ret;
+
+    for (;;) {
+        ret = oxy_ensure_session();
+        if (ret == ESP_OK) {
+            oxy_close_file();
+            ret = oxy_request(OXYII_OP_FILE_START, start, sizeof(start), 5000);
+            if (ret == ESP_OK && s_resp_len < 4) ret = ESP_ERR_INVALID_RESPONSE;
+        }
+        if (ret == ESP_OK) {
+            uint32_t sz = oxyii_le32(s_resp_buf);
+            if (!sized) {
+                ESP_LOGI(TAG, "File size: %lu bytes", (unsigned long)sz);
+                if (sz == 0) { ret = ESP_ERR_INVALID_SIZE; break; }
+                size = sz;
+                sized = true;
+                if (size_cb) size_cb(size, ctx);
+            } else if (sz != size) {
+                /* The file grew between connections: the night is still being
+                 * recorded. The mule sees the short count against the size it
+                 * was given and pulls it again later. */
+                ESP_LOGW(TAG, "oxyii: %s changed size %lu -> %lu across a resume",
+                         filename, (unsigned long)size, (unsigned long)sz);
+                ret = ESP_ERR_INVALID_STATE;
+                break;
+            }
+        }
+
+        while (ret == ESP_OK && offset < size) {
+            uint8_t o[4];
+            oxyii_file_data_payload(offset, o);
+            ret = oxy_request(OXYII_OP_FILE_DATA, o, sizeof(o), 5000);
+            if (ret != ESP_OK) break;
+            if (s_resp_len == 0) break;   /* the ring has nothing more */
+            size_t n = s_resp_len;
+            if (n > size - offset) n = size - offset;
+            if (cb && !cb(s_resp_buf, n, offset, ctx)) {
+                ESP_LOGE(TAG, "Stream callback error at %lu bytes", (unsigned long)offset);
+                oxy_close_file();
+                if (out_len) *out_len = offset;
+                return ESP_FAIL;
+            }
+            offset += n;
+        }
+        if (ret == ESP_OK) break;
+
+        /* Before the size is known the mule is still waiting on the file's
+         * size, and a failed open is answered at once, as with the legacy
+         * ring. */
+        if (!sized || ++resumes > OXY_MAX_RESUMES) break;
+        ESP_LOGW(TAG, "oxyii: %s stalled at %lu/%lu (%s); reconnect and resume %d/%d",
+                 filename, (unsigned long)offset, (unsigned long)size,
+                 esp_err_to_name(ret), resumes, OXY_MAX_RESUMES);
+        /* A set bit left by the first link would end the wait below at once. */
+        xEventGroupClearBits(s_cmd_events, EVT_CONNECTED);
+        if (s_ready) {
+            o2ring_ble_disconnect();
+            for (int i = 0; i < 40 && s_ready; i++) vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        ret = o2ring_ble_connect_and_wait(15000);
+        if (ret == ESP_OK && !s_ready) ret = ESP_ERR_INVALID_STATE;
+        if (ret != ESP_OK) break;
+    }
+
+    if (s_ready) oxy_close_file();
+    if (out_len) *out_len = offset;
+    if (ret == ESP_OK && offset < size) {
+        ESP_LOGW(TAG, "oxyii: ring ended %s at %lu of %lu bytes",
+                 filename, (unsigned long)offset, (unsigned long)size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (ret == ESP_OK) ESP_LOGI(TAG, "Streamed %lu bytes", (unsigned long)offset);
+    return ret;
+}
+
 /* ── Public API ── */
 
 esp_err_t o2ring_ble_init(void)
@@ -841,6 +1305,12 @@ esp_err_t o2ring_ble_init(void)
     s_dl_buf_size = 0;
     s_dl_offset = 0;
     s_dl_cb_error = false;
+    /* A cached address is a legacy ring's; an O2Ring-S is matched by scan. */
+    s_proto = RING_LEGACY;
+    s_oxy_by_t8520 = false;
+    s_oxy_skip_t8520 = false;
+    s_oxy_session = false;
+    s_oxy_wait_op = -1;
 
     o2ring_load_cached_addr();
 
@@ -967,6 +1437,12 @@ esp_err_t o2ring_ble_refresh_info(void)
     if (xSemaphoreTake(s_cmd_mutex, pdMS_TO_TICKS(15000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
+    if (s_proto == RING_OXYII) {
+        esp_err_t oret = oxy_refresh_info();
+        xSemaphoreGive(s_cmd_mutex);
+        return oret;
+    }
+
     s_info.valid = false;
     esp_err_t ret = send_and_wait(CMD_INFO, 0, NULL, 0, 10000);
     if (ret != ESP_OK) {
@@ -1084,6 +1560,12 @@ esp_err_t o2ring_ble_read_sensors(void)
     if (xSemaphoreTake(s_cmd_mutex, pdMS_TO_TICKS(5000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
+    if (s_proto == RING_OXYII) {
+        esp_err_t oret = oxy_read_sensors();
+        xSemaphoreGive(s_cmd_mutex);
+        return oret;
+    }
+
     esp_err_t ret = send_and_wait(CMD_READ_SENSORS, 0, NULL, 0, 5000);
     if (ret != ESP_OK) {
         xSemaphoreGive(s_cmd_mutex);
@@ -1115,6 +1597,8 @@ esp_err_t o2ring_ble_download_file(const char *filename,
                                    size_t *out_len)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
+    /* Nothing calls the buffered pull; the O2Ring-S is only streamed. */
+    if (s_proto == RING_OXYII) return ESP_ERR_NOT_SUPPORTED;
     if (xSemaphoreTake(s_cmd_mutex, pdMS_TO_TICKS(30000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
@@ -1200,6 +1684,12 @@ esp_err_t o2ring_ble_download_file_stream(const char *filename,
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_cmd_mutex, pdMS_TO_TICKS(30000)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
+
+    if (s_proto == RING_OXYII) {
+        esp_err_t oret = oxy_download_stream(filename, size_cb, cb, ctx, out_len);
+        xSemaphoreGive(s_cmd_mutex);
+        return oret;
+    }
 
     ESP_LOGI(TAG, "Streaming download: %s", filename);
 

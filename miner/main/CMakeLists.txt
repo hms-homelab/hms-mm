@@ -10,6 +10,7 @@ idf_component_register(
         "ez_retry.c"
         "ez_error.c"
         "o2ring_ble_nimble.c"
+        "oxyii_proto.c"
         "ota_handler.c"
     INCLUDE_DIRS "."
     REQUIRES
